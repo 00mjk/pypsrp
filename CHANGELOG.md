@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.0.0 - TBD
+
+### Breaking changes
+
+* Changed http dep from `requests` to `httpx` to support `asyncio`
+* Removed the `credssp_minimum_version` kwarg for `pypsrp.wsman.WSMan` as the underlying library does not support setting this option
+
+
 ## 0.8.1 - 2022-02-22
 
 * Bump `requests-credssp` minimumt to new version to support newer encryption format and simpler dependencies

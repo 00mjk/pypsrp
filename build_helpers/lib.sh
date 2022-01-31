@@ -77,7 +77,7 @@ lib::setup::python_requirements() {
         --no-build-isolation \
         --no-dependencies \
         --verbose
-    python -m pip install pypsrp[credssp,kerberos]
+    python -m pip install pypsrp[credssp,kerberos,socks,ssh]
 
     echo "Installing dev dependencies"
     python -m pip install -r requirements-dev.txt
@@ -117,6 +117,7 @@ lib::tests::run() {
         --verbose \
         --junitxml junit/test-results.xml \
         --cov pypsrp \
+        --cov psrp \
         --cov-report xml \
         --cov-report term-missing
 
