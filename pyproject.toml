@@ -24,7 +24,7 @@ profile = "black"
 
 [tool.mypy]
 exclude = "build/"
-mypy_path = "$MYPY_CONFIG_FILE_DIR/src:$MYPY_CONFIG_FILE_DIR/stubs"
+mypy_path = "$MYPY_CONFIG_FILE_DIR/src"
 show_error_codes = true
 show_column_numbers = true
 disallow_any_unimported = true
@@ -42,6 +42,10 @@ disallow_untyped_defs = true
 check_untyped_defs = true
 warn_return_any = true
 warn_unreachable = true
+
+[[tool.mypy.overrides]]
+module = "asyncssh.*"
+implicit_reexport = true  # asyncssh does not explicitly export these symbols
 
 [[tool.mypy.overrides]]
 module = "requests.packages.urllib3.*"

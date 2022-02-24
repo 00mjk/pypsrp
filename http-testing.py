@@ -92,6 +92,8 @@ class AsyncWSManTransport(httpx.AsyncBaseTransport):
         request: httpx.Request,
     ) -> httpx.Response:
         out_token = None
+        ext = request.extensions.copy()
+        ext["trace"] = self.trace
 
         while True:
             headers = request.headers.raw
@@ -110,7 +112,7 @@ class AsyncWSManTransport(httpx.AsyncBaseTransport):
                 ),
                 headers=headers,
                 content=request.stream,
-                extensions=request.extensions,
+                extensions=ext,
             )
 
             resp = await self._connection.handle_async_request(req)
@@ -194,7 +196,7 @@ async def connection(uri: str) -> None:
     wsman = AsyncWSManTransport(uri, ssl_context)
 
     async with httpx.AsyncClient(headers=headers, timeout=timeout, transport=wsman) as client:
-        resp = await client.post(uri, extensions={"trace": wsman.trace})
+        resp = await client.post(uri)
         resp.raise_for_status()
 
 

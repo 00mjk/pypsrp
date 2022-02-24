@@ -1,66 +1,68 @@
 # -*- coding: utf-8 -*-
-# Copyright: (c) 2021, Jordan Borean (@jborean93) <jborean93@gmail.com>
+# Copyright: (c) 2022, Jordan Borean (@jborean93) <jborean93@gmail.com>
 # MIT License (see LICENSE or https://opensource.org/licenses/MIT)
 
 import enum
-import typing
+import typing as t
+
+
+class WSManFaultCode(enum.IntEnum):
+    """WSMan error codes.
+
+    A collection of known WSMan error codes as retrieved from `wsman.h`_ in the
+    Windows SDK. This is built based on the WSManFault exceptions that have
+    been defined.
+
+    .. wsman.h:
+        https://github.com/tpn/winsdk-10/blob/master/Include/10.0.16299.0/um/wsmandisp.h
+    """
+
+    OPERATION_ABORTED = 0x000003E3
+    OPERATION_TIMED_OUT = 0x80338029
+    SERVICE_STREAM_DISCONNECTED = 0x803381DE
+    UNKNOWN = 0x8033FFFF
 
 
 class _WSManFaultRegistry(type):
-    __registry = {}
+    __registry: t.Dict[int, "_WSManFaultRegistry"] = {}
 
     def __init__(
         cls,
-        name,
-        bases,
-        attributes,
-    ):
-        cls.__registry.setdefault(cls.CODE, cls)
-
-    def __call__(cls, **kwargs):
-        code = None
-        if "code" in kwargs:
-            code = kwargs.pop("code")
-        code = code if code is not None else cls.CODE
-
-        new_cls = cls
+        *args: t.Any,
+        **kwargs: t.Any,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        code = getattr(cls, "CODE", None)
         if code is not None:
+            cls.__registry[int(code)] = cls
+
+    def __call__(
+        cls,
+        code: t.Optional[int] = None,
+        *args: t.Any,
+        **kwargs: t.Any,
+    ) -> t.Any:
+        new_cls = cls
+        if code is None:
+            code = getattr(cls, "CODE", WSManFaultCode.UNKNOWN)
+        else:
             new_cls = cls.__registry.get(code, cls)
 
-        return super(_WSManFaultRegistry, new_cls).__call__(code=code, **kwargs)
-
-    @staticmethod
-    def registry_entries() -> typing.List[typing.Tuple[str, int]]:
-        """Builds a tuple that is used to define the WSManFaultCode enum."""
-        entries = []
-        for error_details in _WSManFaultRegistry.__registry.values():
-            name = error_details.MESSAGE_ID
-            if name.startswith("ERROR_"):
-                name = name[6:]
-
-            if name.startswith("WSMAN_"):
-                name = name[6:]
-
-            value = error_details.CODE
-
-            entries.append((name, value))
-
-        return entries
+        return super(_WSManFaultRegistry, new_cls).__call__(code=code, *args, **kwargs)
 
 
 class WSManFault(Exception, metaclass=_WSManFaultRegistry):
-    CODE = 0x8033FFFF
+    CODE = WSManFaultCode.UNKNOWN
     MESSAGE = "Unknown WS-Management fault."
-    MESSAGE_ID = "ERROR_WSMAN_UNKNOWN"
 
     def __init__(
         self,
-        code: typing.Optional[int] = None,
-        machine: typing.Optional[str] = None,
-        reason: typing.Optional[str] = None,
-        provider: typing.Optional[str] = None,
-        provider_path: typing.Optional[str] = None,
-        provider_fault: typing.Optional[str] = None,
+        code: t.Optional[int] = None,
+        machine: t.Optional[str] = None,
+        reason: t.Optional[str] = None,
+        provider: t.Optional[str] = None,
+        provider_path: t.Optional[str] = None,
+        provider_fault: t.Optional[str] = None,
     ):
         self.code = code
         self.machine = machine
@@ -70,7 +72,7 @@ class WSManFault(Exception, metaclass=_WSManFaultRegistry):
         self.provider_fault = provider_fault
 
     @property
-    def message(self):
+    def message(self) -> str:
         error_details = []
         if self.code:
             error_details.append("Code: %s" % self.code)
@@ -95,37 +97,21 @@ class WSManFault(Exception, metaclass=_WSManFaultRegistry):
 
         return "Received a WSManFault message. (%s)" % ", ".join(error_details)
 
-    def __str__(self):
+    def __str__(self) -> str:
         return self.message
 
 
 class OperationAborted(WSManFault):
     # Not a WSMan NtStatus code but is returned on an active Receive request when the shell is closed.
-    CODE = 0x000003E3
+    CODE = WSManFaultCode.OPERATION_ABORTED
     MESSAGE = "The I/O operation has been aborted because of either a thread exit or an application request."
-    MESSAGE_ID = "ERROR_OPERATION_ABORTED"
 
 
 class OperationTimedOut(WSManFault):
-    CODE = 0x80338029
-    MESSAGE = (
-        "The WS-Management service cannot complete the operation within the time specified in " "OperationTimeout."
-    )
-    MESSAGE_ID = "ERROR_WSMAN_OPERATION_TIMEDOUT"
+    CODE = WSManFaultCode.OPERATION_TIMED_OUT
+    MESSAGE = "The WS-Management service cannot complete the operation within the time specified in OperationTimeout."
 
 
 class ServiceStreamDisconnected(WSManFault):
-    CODE = 0x803381DE
+    CODE = WSManFaultCode.SERVICE_STREAM_DISCONNECTED
     MESSAGE = "The WS-Management service cannot process the request because the stream is currently disconnected."
-    MESSAGE_ID = "ERROR_WSMAN_SERVICE_STREAM_DISCONNECTED"
-
-
-"""WSMan error codes.
-
-A collection of known WSMan error codes as retrieved from `wsman.h`_ in the Windows SDK. This is built based on the
-WSManFault exceptions that have been defined.
-
-.. wsman.h:
-    https://github.com/tpn/winsdk-10/blob/master/Include/10.0.16299.0/um/wsmandisp.h
-"""
-WSManFaultCode = enum.IntEnum("WSManFaultCode", _WSManFaultRegistry.registry_entries(), module=__name__)

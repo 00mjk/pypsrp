@@ -4,33 +4,26 @@
 
 import asyncio
 import logging
-import typing
+import typing as t
+
+import asyncssh
 
 from psrp._connection.out_of_proc import AsyncOutOfProcInfo
 
 log = logging.getLogger(__name__)
 
 
-HAS_SSH = True
-try:
-    import asyncssh
-except ImportError:
-    HAS_SSH = False
+class _ClientSession(asyncssh.SSHClientSession):
+    def __init__(self) -> None:
+        self.incoming: asyncio.Queue[t.Optional[bytes]] = asyncio.Queue()
+        self._buffer = bytearray()
 
-if HAS_SSH:
-
-    class _ClientSession(asyncssh.SSHClientSession):
-        def __init__(self):
-            self.incoming: asyncio.Queue[typing.Optional[bytes]] = asyncio.Queue()
-            self._buffer = bytearray()
-
-        def data_received(self, data, datatype):
-            self.incoming.put_nowait(data)
-
-else:
-
-    class _ClientSession:
-        pass
+    def data_received(
+        self,
+        data: bytes,
+        datatype: t.Optional[int],
+    ) -> None:
+        self.incoming.put_nowait(data)
 
 
 class AsyncSSHInfo(AsyncOutOfProcInfo):
@@ -38,15 +31,12 @@ class AsyncSSHInfo(AsyncOutOfProcInfo):
         self,
         hostname: str,
         port: int = 22,
-        username: typing.Optional[str] = None,
-        password: typing.Optional[str] = None,
+        username: t.Optional[str] = None,
+        password: t.Optional[str] = None,
         subsystem: str = "powershell",
-        executable: typing.Optional[str] = None,
-        arguments: typing.Optional[typing.List[str]] = None,
+        executable: t.Optional[str] = None,
+        arguments: t.Optional[t.List[str]] = None,
     ) -> None:
-        if not HAS_SSH:
-            raise Exception("FIXME asyncssh not installed")
-
         super().__init__()
 
         self._hostname = hostname
@@ -57,17 +47,23 @@ class AsyncSSHInfo(AsyncOutOfProcInfo):
         self._executable = executable
         self._arguments = arguments or []
 
-        self._ssh: typing.Optional[asyncssh.SSHClientConnection] = None
-        self._channel: typing.Optional[asyncssh.SSHClientChannel] = None
-        self._session: typing.Optional[_ClientSession] = None
+        self._ssh: t.Optional[asyncssh.SSHClientConnection] = None
+        self._channel: t.Optional[asyncssh.SSHClientChannel] = None
+        self._session: t.Optional[_ClientSession] = None
 
-    async def read(self) -> typing.Optional[bytes]:
+    async def read(self) -> t.Optional[bytes]:
+        if not self._session:
+            raise Exception("FIXME: Session not started")
+
         return await self._session.incoming.get()
 
     async def write(
         self,
         data: bytes,
     ) -> None:
+        if not self._channel:
+            raise Exception("FIXME: Session not started")
+
         self._channel.write(data)
 
     async def start(self) -> None:
@@ -82,17 +78,15 @@ class AsyncSSHInfo(AsyncOutOfProcInfo):
             options=conn_options,
         )
 
-        cmd = ()
+        cmd: t.Union[str, t.Tuple[()]] = ()
         if self._executable:
-            cmd = [self._executable]
-            cmd.extend(self._arguments)
-            cmd = " ".join(cmd)
+            cmd = " ".join([self._executable] + self._arguments)
             subsystem = None
 
         else:
             subsystem = self._subsystem
 
-        self._channel, self._session = await self._ssh.create_session(
+        self._channel, self._session = await self._ssh.create_session(  # type: ignore[assignment]
             _ClientSession,
             command=cmd,
             subsystem=subsystem,
@@ -108,4 +102,5 @@ class AsyncSSHInfo(AsyncOutOfProcInfo):
             self._ssh.close()
             self._ssh = None
 
-        self._session.incoming.put_nowait(None)
+        if self._session:
+            self._session.incoming.put_nowait(None)

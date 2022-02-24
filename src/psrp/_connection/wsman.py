@@ -6,7 +6,7 @@ import asyncio
 import base64
 import logging
 import threading
-import typing
+import typing as t
 import uuid
 import xml.etree.ElementTree as ElementTree
 
@@ -23,9 +23,9 @@ from psrp._exceptions import (
     OperationTimedOut,
     ServiceStreamDisconnected,
 )
-from psrp.io.wsman import AsyncWSManConnection, WSManConnection
-from psrp.protocol.winrs import WinRS
-from psrp.protocol.wsman import (
+from psrp._io.wsman import AsyncWSManConnection, WSManConnection, WSManConnectionInfo
+from psrp._winrs import WinRS, enumerate_winrs, receive_winrs_enumeration
+from psrp._wsman import (
     NAMESPACES,
     CommandState,
     OptionSet,
@@ -40,23 +40,19 @@ log = logging.getLogger(__name__)
 class WSManInfo(ConnectionInfo):
     def __init__(
         self,
-        connection_uri: str,
-        configuration_name="Microsoft.PowerShell",
-        buffer_mode: OutputBufferingMode = OutputBufferingMode.none,
-        idle_timeout: typing.Optional[int] = None,
-        *args,
-        **kwargs,
-    ):
+        connection_info: WSManConnectionInfo,
+        configuration_name: str = "Microsoft.PowerShell",
+        buffer_mode: OutputBufferingMode = OutputBufferingMode.NONE,
+        idle_timeout: t.Optional[int] = None,
+    ) -> None:
         super().__init__()
 
-        self._connection_args = args
-        self._connection_kwargs = kwargs
-        self._connection_kwargs["connection_uri"] = connection_uri
-        self._connection = WSManConnection(*self._connection_args, **self._connection_kwargs)
+        self._connection_info = connection_info
+        self._connection = WSManConnection(connection_info)
 
-        self._runspace_table: typing.Dict[uuid.UUID, WinRS] = {}
-        self._listener_tasks: typing.Dict[str, threading.Thread] = {}
-        self._connection_uri = connection_uri
+        self._runspace_table: t.Dict[uuid.UUID, WinRS] = {}
+        self._listener_tasks: t.Dict[str, threading.Thread] = {}
+        self._connection_uri = connection_info.connection_uri
         self._buffer_mode = buffer_mode
         self._idle_timeout = idle_timeout
         self._configuration_name = f"http://schemas.microsoft.com/powershell/{configuration_name}"
@@ -64,10 +60,10 @@ class WSManInfo(ConnectionInfo):
     def close(
         self,
         pool: ClientRunspacePool,
-        pipeline_id: typing.Optional[uuid.UUID] = None,
-    ):
+        pipeline_id: t.Optional[uuid.UUID] = None,
+    ) -> None:
         if pipeline_id is not None:
-            self.signal(pool, str(pipeline_id).upper(), signal_code=SignalCode.terminate)
+            self.signal(pool, pipeline_id, signal_code=SignalCode.TERMINATE)
 
             pipeline_task = self._listener_tasks.pop(f"{pool.runspace_pool_id}:{pipeline_id}")
             pipeline_task.join()
@@ -75,7 +71,7 @@ class WSManInfo(ConnectionInfo):
         else:
             winrs = self._runspace_table[pool.runspace_pool_id]
             winrs.close()
-            resp = self._connection.send(winrs.data_to_send())
+            resp = self._connection.post(winrs.data_to_send())
             winrs.receive_data(resp)
 
             # We don't get a RnuspacePool state change response on our receive listener so manually change the state.
@@ -96,12 +92,12 @@ class WSManInfo(ConnectionInfo):
         self,
         pool: ClientRunspacePool,
         pipeline_id: uuid.UUID,
-    ):
+    ) -> None:
         winrs = self._runspace_table[pool.runspace_pool_id]
 
-        payload = self.next_payload(pool)
-        winrs.command("", args=[base64.b64encode(payload.data).decode()], command_id=str(pipeline_id).upper())
-        resp = self._connection.send(winrs.data_to_send())
+        payload = t.cast(PSRPPayload, self.next_payload(pool))
+        winrs.command("", args=[base64.b64encode(payload.data).decode()], command_id=pipeline_id)
+        resp = self._connection.post(winrs.data_to_send())
         winrs.receive_data(resp)
 
         self._create_listener(pool, pipeline_id)
@@ -109,7 +105,7 @@ class WSManInfo(ConnectionInfo):
     def create(
         self,
         pool: ClientRunspacePool,
-    ):
+    ) -> None:
         winrs = WinRS(
             WSMan(self._connection_uri),
             self._configuration_name,
@@ -119,7 +115,7 @@ class WSManInfo(ConnectionInfo):
         )
         self._runspace_table[pool.runspace_pool_id] = winrs
 
-        payload = self.next_payload(pool)
+        payload = t.cast(PSRPPayload, self.next_payload(pool))
 
         open_content = ElementTree.Element("creationXml", xmlns="http://schemas.microsoft.com/powershell")
         open_content.text = base64.b64encode(payload.data).decode()
@@ -127,7 +123,7 @@ class WSManInfo(ConnectionInfo):
         options.add_option("protocolversion", pool.our_capability.protocolversion, {"MustComply": "true"})
         winrs.open(options, open_content)
 
-        resp = self._connection.send(winrs.data_to_send())
+        resp = self._connection.post(winrs.data_to_send())
         winrs.receive_data(resp)
 
         self._create_listener(pool)
@@ -144,8 +140,8 @@ class WSManInfo(ConnectionInfo):
         winrs = self._runspace_table[pool.runspace_pool_id]
 
         stream = "stdin" if payload.stream_type == StreamType.default else "pr"
-        winrs.send(stream, payload.data, command_id=str(payload.pipeline_id).upper())
-        resp = self._connection.send(winrs.data_to_send())
+        winrs.send(stream, payload.data, command_id=payload.pipeline_id)
+        resp = self._connection.post(winrs.data_to_send())
         winrs.receive_data(resp)
 
         return True
@@ -153,69 +149,20 @@ class WSManInfo(ConnectionInfo):
     def signal(
         self,
         pool: ClientRunspacePool,
-        pipeline_id: typing.Optional[uuid.UUID] = None,
-        signal_code: SignalCode = SignalCode.ps_ctrl_c,
-    ):
+        pipeline_id: uuid.UUID,
+        signal_code: SignalCode = SignalCode.PS_CTRL_C,
+    ) -> None:
         winrs = self._runspace_table[pool.runspace_pool_id]
 
-        winrs.signal(signal_code, str(pipeline_id).upper())
-        resp = self._connection.send(winrs.data_to_send())
+        winrs.signal(signal_code, pipeline_id)
+        resp = self._connection.post(winrs.data_to_send())
         winrs.receive_data(resp)
-
-    def disconnect(
-        self,
-        pool: ClientRunspacePool,
-        buffer_mode: OutputBufferingMode = OutputBufferingMode.none,
-        idle_timeout: typing.Optional[typing.Union[int, float]] = None,
-    ):
-        winrs = self._runspace_table[pool.runspace_pool_id]
-        rsp = NAMESPACES["rsp"]
-
-        disconnect = ElementTree.Element("{%s}Disconnect" % rsp)
-        if buffer_mode != OutputBufferingMode.none:
-            buffer_mode_str = "Block" if buffer_mode == OutputBufferingMode.block else "Drop"
-            ElementTree.SubElement(disconnect, "{%s}BufferMode" % rsp).text = buffer_mode_str
-
-        if idle_timeout:
-            idle_str = f"PT{idle_timeout}S"
-            ElementTree.SubElement(disconnect, "{%s}IdleTimeout" % rsp).text = idle_str
-
-        winrs.wsman.disconnect(winrs.resource_uri, disconnect, selector_set=winrs.selector_set)
-        resp = self._connection.send(winrs.data_to_send())
-        winrs.receive_data(resp)
-
-    def reconnect(
-        self,
-        pool: ClientRunspacePool,
-    ):
-        winrs = self._runspace_table[pool.runspace_pool_id]
-
-        winrs.wsman.reconnect(winrs.resource_uri, selector_set=winrs.selector_set)
-        resp = self._connection.send(winrs.data_to_send())
-        winrs.receive_data(resp)
-
-        self._create_listener(pool)
-
-    def enumerate(self) -> typing.AsyncIterable[typing.Tuple[uuid.UUID, typing.List[str]]]:
-        winrs = WinRS(WSMan(self._connection_uri))
-        winrs.enumerate()
-        resp = self._connection.send(winrs.data_to_send())
-        shell_enumeration = winrs.receive_data(resp)
-
-        for shell in shell_enumeration.shells:
-            shell.enumerate("http://schemas.microsoft.com/wbem/wsman/1/windows/shell/Command", shell.selector_set)
-            resp = self._connection.send(winrs.data_to_send())
-            cmd_enumeration = winrs.receive_data(resp)
-
-            self._runspace_table[uuid.UUID(shell.shell_id)] = shell
-
-            yield uuid.UUID(shell.shell_id), cmd_enumeration.commands
 
     def connect(
         self,
         pool: ClientRunspacePool,
-        pipeline_id: typing.Optional[uuid.UUID] = None,
-    ):
+        pipeline_id: t.Optional[uuid.UUID] = None,
+    ) -> None:
         rsp = NAMESPACES["rsp"]
         connect = ElementTree.Element("{%s}Connect" % rsp)
         if pipeline_id:
@@ -223,7 +170,7 @@ class WSManInfo(ConnectionInfo):
             options = None
 
         else:
-            payload = self.next_payload(pool)
+            payload = t.cast(PSRPPayload, self.next_payload(pool))
 
             options = OptionSet()
             options.add_option("protocolversion", pool.our_capability.protocolversion, {"MustComply": "true"})
@@ -235,22 +182,80 @@ class WSManInfo(ConnectionInfo):
 
         winrs = self._runspace_table[pool.runspace_pool_id]
         winrs.wsman.connect(winrs.resource_uri, connect, option_set=options, selector_set=winrs.selector_set)
-        resp = self._connection.send(winrs.data_to_send())
+        resp = self._connection.post(winrs.data_to_send())
         event = winrs.wsman.receive_data(resp)
 
         if not pipeline_id:
-            response_xml = event.body.find("rsp:ConnectResponse/pwsh:connectResponseXml", NAMESPACES).text
+            response_xml = t.cast(
+                ElementTree.Element, event.body.find("rsp:ConnectResponse/pwsh:connectResponseXml", NAMESPACES)
+            )
 
-            psrp_resp = PSRPPayload(base64.b64decode(response_xml), StreamType.default, None)
+            psrp_resp = PSRPPayload(base64.b64decode(response_xml.text or ""), StreamType.default, None)
             pool.receive_data(psrp_resp)
 
         self._create_listener(pool, pipeline_id=pipeline_id)
 
+    def disconnect(
+        self,
+        pool: ClientRunspacePool,
+        buffer_mode: OutputBufferingMode = OutputBufferingMode.NONE,
+        idle_timeout: t.Optional[t.Union[int, float]] = None,
+    ) -> None:
+        winrs = self._runspace_table[pool.runspace_pool_id]
+        rsp = NAMESPACES["rsp"]
+
+        disconnect = ElementTree.Element("{%s}Disconnect" % rsp)
+        if buffer_mode != OutputBufferingMode.NONE:
+            buffer_mode_str = "Block" if buffer_mode == OutputBufferingMode.BLOCK else "Drop"
+            ElementTree.SubElement(disconnect, "{%s}BufferMode" % rsp).text = buffer_mode_str
+
+        if idle_timeout:
+            idle_str = f"PT{idle_timeout}S"
+            ElementTree.SubElement(disconnect, "{%s}IdleTimeout" % rsp).text = idle_str
+
+        winrs.wsman.disconnect(winrs.resource_uri, disconnect, selector_set=winrs.selector_set)
+        resp = self._connection.post(winrs.data_to_send())
+        winrs.receive_data(resp)
+
+    def reconnect(
+        self,
+        pool: ClientRunspacePool,
+    ) -> None:
+        winrs = self._runspace_table[pool.runspace_pool_id]
+
+        winrs.wsman.reconnect(winrs.resource_uri, selector_set=winrs.selector_set)
+        resp = self._connection.post(winrs.data_to_send())
+        winrs.receive_data(resp)
+
+        self._create_listener(pool)
+
+    def enumerate(self) -> t.Iterator[t.Tuple[uuid.UUID, t.List[uuid.UUID]]]:
+        wsman = WSMan(self._connection_uri)
+        enumerate_winrs(wsman)
+        resp = self._connection.post(wsman.data_to_send())
+        shell_enumeration = wsman.receive_data(resp)
+
+        shells = receive_winrs_enumeration(wsman, shell_enumeration)[0]
+        for shell in shells:
+            enumerate_winrs(
+                wsman,
+                resource_uri="http://schemas.microsoft.com/wbem/wsman/1/windows/shell/Command",
+                selector_filter=shell.selector_set,
+            )
+            resp = self._connection.post(wsman.data_to_send())
+            cmd_enumeration = wsman.receive_data(resp)
+            commands = receive_winrs_enumeration(wsman, cmd_enumeration)[1]
+
+            shell_id = shell.shell_id
+            self._runspace_table[shell_id] = shell
+
+            yield shell_id, commands
+
     def _create_listener(
         self,
         pool: ClientRunspacePool,
-        pipeline_id: typing.Optional[uuid.UUID] = None,
-    ):
+        pipeline_id: t.Optional[uuid.UUID] = None,
+    ) -> None:
         started = threading.Event()
         task = threading.Thread(target=self._listen, args=(started, pool, pipeline_id))
         self._listener_tasks[f'{pool.runspace_pool_id}:{str(pipeline_id) or ""}'] = task
@@ -261,36 +266,36 @@ class WSManInfo(ConnectionInfo):
         self,
         started: threading.Event,
         pool: ClientRunspacePool,
-        pipeline_id: typing.Optional[uuid.UUID] = None,
-    ):
+        pipeline_id: t.Optional[uuid.UUID] = None,
+    ) -> None:
         winrs = self._runspace_table[pool.runspace_pool_id]
 
-        with WSManConnection(*self._connection_args, **self._connection_kwargs) as conn:
+        with WSManConnection(self._connection_info) as conn:
             while True:
-                winrs.receive("stdout", command_id=(str(pipeline_id).upper() if pipeline_id else None))
+                winrs.receive("stdout", command_id=pipeline_id)
 
-                resp = conn.send(winrs.data_to_send())
+                resp = conn.post(winrs.data_to_send())
                 # TODO: Will the ReceiveResponse block if not all the fragments have been sent?
                 started.set()
 
                 try:
-                    event: ReceiveResponseEvent = winrs.receive_data(resp)
+                    event = t.cast(ReceiveResponseEvent, winrs.receive_data(resp))
 
                 except OperationTimedOut:
                     # Occurs when there has been no output after the OperationTimeout set, just repeat the request
                     continue
 
-                except (OperationAborted, ServiceStreamDisconnected) as e:
+                except (OperationAborted, ServiceStreamDisconnected):
                     # Received when the shell or pipeline has been closed
                     break
 
-                for psrp_data in event.get_streams().get("stdout", []):
+                for psrp_data in event.streams.get("stdout", []):
                     msg = PSRPPayload(psrp_data, StreamType.default, pipeline_id)
                     self.queue_response(pool.runspace_pool_id, msg)
 
                 # If the command is done then we've got nothing left to do here.
                 # TODO: do we need to surface the exit_code into the protocol.
-                if event.command_state == CommandState.done:
+                if event.command_state == CommandState.DONE:
                     break
 
             if pipeline_id is None:
@@ -310,23 +315,19 @@ class AsyncWSManInfo(AsyncConnectionInfo):
 
     def __init__(
         self,
-        connection_uri: str,
-        configuration_name="Microsoft.PowerShell",
-        buffer_mode: OutputBufferingMode = OutputBufferingMode.none,
-        idle_timeout: typing.Optional[int] = None,
-        *args,
-        **kwargs,
-    ):
+        connection_info: WSManConnectionInfo,
+        configuration_name: str = "Microsoft.PowerShell",
+        buffer_mode: OutputBufferingMode = OutputBufferingMode.NONE,
+        idle_timeout: t.Optional[int] = None,
+    ) -> None:
         super().__init__()
 
-        self._connection_args = args
-        self._connection_kwargs = kwargs
-        self._connection_kwargs["connection_uri"] = connection_uri
-        self._connection = AsyncWSManConnection(*self._connection_args, **self._connection_kwargs)
+        self._connection_info = connection_info
+        self._connection = AsyncWSManConnection(connection_info)
 
-        self._runspace_table: typing.Dict[uuid.UUID, WinRS] = {}
-        self._listener_tasks: typing.Dict[str, asyncio.Task] = {}
-        self._connection_uri = connection_uri
+        self._runspace_table: t.Dict[uuid.UUID, WinRS] = {}
+        self._listener_tasks: t.Dict[str, asyncio.Task] = {}
+        self._connection_uri = connection_info.connection_uri
         self._buffer_mode = buffer_mode
         self._idle_timeout = idle_timeout
         self._configuration_name = f"http://schemas.microsoft.com/powershell/{configuration_name}"
@@ -334,10 +335,10 @@ class AsyncWSManInfo(AsyncConnectionInfo):
     async def close(
         self,
         pool: ClientRunspacePool,
-        pipeline_id: typing.Optional[uuid.UUID] = None,
-    ):
+        pipeline_id: t.Optional[uuid.UUID] = None,
+    ) -> None:
         if pipeline_id is not None:
-            await self.signal(pool, pipeline_id, signal_code=SignalCode.terminate)
+            await self.signal(pool, pipeline_id, signal_code=SignalCode.TERMINATE)
 
             pipeline_task = self._listener_tasks.pop(f"{pool.runspace_pool_id}:{pipeline_id}")
             await pipeline_task
@@ -345,7 +346,7 @@ class AsyncWSManInfo(AsyncConnectionInfo):
         else:
             winrs = self._runspace_table[pool.runspace_pool_id]
             winrs.close()
-            resp = await self._connection.send(winrs.data_to_send())
+            resp = await self._connection.post(winrs.data_to_send())
             winrs.receive_data(resp)
 
             # We don't get a RnuspacePool state change response on our receive listener so manually change the state.
@@ -368,12 +369,12 @@ class AsyncWSManInfo(AsyncConnectionInfo):
         self,
         pool: ClientRunspacePool,
         pipeline_id: uuid.UUID,
-    ):
+    ) -> None:
         winrs = self._runspace_table[pool.runspace_pool_id]
 
-        payload = self.next_payload(pool)
-        winrs.command("", args=[base64.b64encode(payload.data).decode()], command_id=str(pipeline_id))
-        resp = await self._connection.send(winrs.data_to_send())
+        payload = t.cast(PSRPPayload, self.next_payload(pool))
+        winrs.command("", args=[base64.b64encode(payload.data).decode()], command_id=pipeline_id)
+        resp = await self._connection.post(winrs.data_to_send())
         winrs.receive_data(resp)
 
         await self._create_listener(pool, pipeline_id)
@@ -381,7 +382,7 @@ class AsyncWSManInfo(AsyncConnectionInfo):
     async def create(
         self,
         pool: ClientRunspacePool,
-    ):
+    ) -> None:
         winrs = WinRS(
             WSMan(self._connection_uri),
             self._configuration_name,
@@ -391,7 +392,7 @@ class AsyncWSManInfo(AsyncConnectionInfo):
         )
         self._runspace_table[pool.runspace_pool_id] = winrs
 
-        payload = self.next_payload(pool)
+        payload = t.cast(PSRPPayload, self.next_payload(pool))
 
         open_content = ElementTree.Element("creationXml", xmlns="http://schemas.microsoft.com/powershell")
         open_content.text = base64.b64encode(payload.data).decode()
@@ -399,7 +400,7 @@ class AsyncWSManInfo(AsyncConnectionInfo):
         options.add_option("protocolversion", pool.our_capability.protocolversion, {"MustComply": "true"})
         winrs.open(options, open_content)
 
-        resp = await self._connection.send(winrs.data_to_send())
+        resp = await self._connection.post(winrs.data_to_send())
         winrs.receive_data(resp)
 
         await self._create_listener(pool)
@@ -417,7 +418,7 @@ class AsyncWSManInfo(AsyncConnectionInfo):
 
         stream = "stdin" if payload.stream_type == StreamType.default else "pr"
         winrs.send(stream, payload.data, command_id=payload.pipeline_id)
-        resp = await self._connection.send(winrs.data_to_send())
+        resp = await self._connection.post(winrs.data_to_send())
         winrs.receive_data(resp)
 
         return True
@@ -425,20 +426,20 @@ class AsyncWSManInfo(AsyncConnectionInfo):
     async def signal(
         self,
         pool: ClientRunspacePool,
-        pipeline_id: typing.Optional[uuid.UUID] = None,
-        signal_code: SignalCode = SignalCode.ps_ctrl_c,
-    ):
+        pipeline_id: uuid.UUID,
+        signal_code: SignalCode = SignalCode.PS_CTRL_C,
+    ) -> None:
         winrs = self._runspace_table[pool.runspace_pool_id]
 
-        winrs.signal(signal_code, str(pipeline_id).upper())
-        resp = await self._connection.send(winrs.data_to_send())
+        winrs.signal(signal_code, pipeline_id)
+        resp = await self._connection.post(winrs.data_to_send())
         winrs.receive_data(resp)
 
     async def connect(
         self,
         pool: ClientRunspacePool,
-        pipeline_id: typing.Optional[uuid.UUID] = None,
-    ):
+        pipeline_id: t.Optional[uuid.UUID] = None,
+    ) -> None:
         rsp = NAMESPACES["rsp"]
         connect = ElementTree.Element("{%s}Connect" % rsp)
         if pipeline_id:
@@ -446,7 +447,7 @@ class AsyncWSManInfo(AsyncConnectionInfo):
             options = None
 
         else:
-            payload = self.next_payload(pool)
+            payload = t.cast(PSRPPayload, self.next_payload(pool))
 
             options = OptionSet()
             options.add_option("protocolversion", pool.our_capability.protocolversion, {"MustComply": "true"})
@@ -458,13 +459,15 @@ class AsyncWSManInfo(AsyncConnectionInfo):
 
         winrs = self._runspace_table[pool.runspace_pool_id]
         winrs.wsman.connect(winrs.resource_uri, connect, option_set=options, selector_set=winrs.selector_set)
-        resp = await self._connection.send(winrs.data_to_send())
+        resp = await self._connection.post(winrs.data_to_send())
         event = winrs.wsman.receive_data(resp)
 
         if not pipeline_id:
-            response_xml = event.body.find("rsp:ConnectResponse/pwsh:connectResponseXml", NAMESPACES).text
+            response_xml = t.cast(
+                ElementTree.Element, event.body.find("rsp:ConnectResponse/pwsh:connectResponseXml", NAMESPACES)
+            )
 
-            psrp_resp = PSRPPayload(base64.b64decode(response_xml), StreamType.default, None)
+            psrp_resp = PSRPPayload(base64.b64decode(response_xml.text or ""), StreamType.default, None)
             pool.receive_data(psrp_resp)
 
         await self._create_listener(pool, pipeline_id=pipeline_id)
@@ -472,15 +475,15 @@ class AsyncWSManInfo(AsyncConnectionInfo):
     async def disconnect(
         self,
         pool: ClientRunspacePool,
-        buffer_mode: OutputBufferingMode = OutputBufferingMode.none,
-        idle_timeout: typing.Optional[typing.Union[int, float]] = None,
-    ):
+        buffer_mode: OutputBufferingMode = OutputBufferingMode.NONE,
+        idle_timeout: t.Optional[t.Union[int, float]] = None,
+    ) -> None:
         winrs = self._runspace_table[pool.runspace_pool_id]
         rsp = NAMESPACES["rsp"]
 
         disconnect = ElementTree.Element("{%s}Disconnect" % rsp)
-        if buffer_mode != OutputBufferingMode.none:
-            buffer_mode_str = "Block" if buffer_mode == OutputBufferingMode.block else "Drop"
+        if buffer_mode != OutputBufferingMode.NONE:
+            buffer_mode_str = "Block" if buffer_mode == OutputBufferingMode.BLOCK else "Drop"
             ElementTree.SubElement(disconnect, "{%s}BufferMode" % rsp).text = buffer_mode_str
 
         if idle_timeout:
@@ -488,39 +491,47 @@ class AsyncWSManInfo(AsyncConnectionInfo):
             ElementTree.SubElement(disconnect, "{%s}IdleTimeout" % rsp).text = idle_str
 
         winrs.wsman.disconnect(winrs.resource_uri, disconnect, selector_set=winrs.selector_set)
-        resp = await self._connection.send(winrs.data_to_send())
+        resp = await self._connection.post(winrs.data_to_send())
         winrs.receive_data(resp)
 
     async def reconnect(
         self,
         pool: ClientRunspacePool,
-    ):
+    ) -> None:
         winrs = self._runspace_table[pool.runspace_pool_id]
 
         winrs.wsman.reconnect(winrs.resource_uri, selector_set=winrs.selector_set)
-        resp = await self._connection.send(winrs.data_to_send())
+        resp = await self._connection.post(winrs.data_to_send())
         winrs.receive_data(resp)
 
-    async def enumerate(self) -> typing.AsyncIterable[typing.Tuple[uuid.UUID, typing.List[str]]]:
-        winrs = WinRS(WSMan(self._connection_uri))
-        winrs.enumerate()
-        resp = await self._connection.send(winrs.data_to_send())
-        shell_enumeration = winrs.receive_data(resp)
+    # No idea why mypy doesn't like this, it's the same signature as the parent
+    async def enumerate(self) -> t.AsyncIterator[t.Tuple[uuid.UUID, t.List[uuid.UUID]]]:  # type: ignore[override]
+        wsman = WSMan(self._connection_uri)
+        enumerate_winrs(wsman)
+        resp = await self._connection.post(wsman.data_to_send())
+        shell_enumeration = wsman.receive_data(resp)
 
-        for shell in shell_enumeration.shells:
-            shell.enumerate("http://schemas.microsoft.com/wbem/wsman/1/windows/shell/Command", shell.selector_set)
-            resp = await self._connection.send(winrs.data_to_send())
-            cmd_enumeration = winrs.receive_data(resp)
+        shells = receive_winrs_enumeration(wsman, shell_enumeration)[0]
+        for shell in shells:
+            enumerate_winrs(
+                wsman,
+                resource_uri="http://schemas.microsoft.com/wbem/wsman/1/windows/shell/Command",
+                selector_filter=shell.selector_set,
+            )
+            resp = await self._connection.post(wsman.data_to_send())
+            cmd_enumeration = wsman.receive_data(resp)
+            commands = receive_winrs_enumeration(wsman, cmd_enumeration)[1]
 
-            self._runspace_table[shell.shell_id] = shell
+            shell_id = shell.shell_id
+            self._runspace_table[shell_id] = shell
 
-            yield shell.shell_id, cmd_enumeration.commands
+            yield shell_id, commands
 
     async def _create_listener(
         self,
         pool: ClientRunspacePool,
-        pipeline_id: typing.Optional[uuid.UUID] = None,
-    ):
+        pipeline_id: t.Optional[uuid.UUID] = None,
+    ) -> None:
         started = asyncio.Event()
         task = asyncio.create_task(self._listen(started, pool, pipeline_id))
         self._listener_tasks[f'{pool.runspace_pool_id}:{pipeline_id or ""}'] = task
@@ -530,20 +541,20 @@ class AsyncWSManInfo(AsyncConnectionInfo):
         self,
         started: asyncio.Event,
         pool: ClientRunspacePool,
-        pipeline_id: typing.Optional[uuid.UUID] = None,
-    ):
+        pipeline_id: t.Optional[uuid.UUID] = None,
+    ) -> None:
         winrs = self._runspace_table[pool.runspace_pool_id]
 
-        async with AsyncWSManConnection(*self._connection_args, **self._connection_kwargs) as conn:
+        async with AsyncWSManConnection(self._connection_info) as conn:
             while True:
-                winrs.receive("stdout", command_id=str(pipeline_id).upper() if pipeline_id else None)
+                winrs.receive("stdout", command_id=pipeline_id)
 
-                resp = await conn.send(winrs.data_to_send())
+                resp = await conn.post(winrs.data_to_send())
                 # TODO: Will the ReceiveResponse block if not all the fragments have been sent?
                 started.set()
 
                 try:
-                    event: ReceiveResponseEvent = winrs.receive_data(resp)
+                    event = t.cast(ReceiveResponseEvent, winrs.receive_data(resp))
 
                 except OperationTimedOut:
                     # Occurs when there has been no output after the OperationTimeout set, just repeat the request
@@ -553,13 +564,13 @@ class AsyncWSManInfo(AsyncConnectionInfo):
                     # Received when the shell or pipeline has been closed
                     break
 
-                for psrp_data in event.get_streams().get("stdout", []):
+                for psrp_data in event.streams.get("stdout", []):
                     msg = PSRPPayload(psrp_data, StreamType.default, pipeline_id)
                     await self.queue_response(pool.runspace_pool_id, msg)
 
                 # If the command is done then we've got nothing left to do here.
                 # TODO: do we need to surface the exit_code into the protocol.
-                if event.command_state == CommandState.done:
+                if event.command_state == CommandState.DONE:
                     break
 
             if pipeline_id is None:

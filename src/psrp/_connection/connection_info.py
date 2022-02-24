@@ -7,7 +7,7 @@ import enum
 import logging
 import queue
 import threading
-import typing
+import typing as t
 import uuid
 
 from psrpcore import ClientRunspacePool, PSRPEvent, PSRPPayload
@@ -20,18 +20,26 @@ class OutputBufferingMode(enum.Enum):
 
     This is used to control what a disconnected PSRP session does when the
     output generated has exceeded the buffer capacity.
+
+    Attributes:
+        NONE: No output buffer mode is selected, the mode is inherited from the
+            session configuration.
+        BLOCK: When the output buffer is full, execution is suspended until the
+            buffer is clear.
+        DROP: When the output buffer is full, execution continues replacing
+            older buffered output.
     """
 
-    none = enum.auto()  #: No output buffer mode is selected, the mode is inherited from the session configuration.
-    block = enum.auto()  #: When the output buffer is full, execution is suspended until the buffer is clear.
-    drop = enum.auto()  #: When the output buffer is full, execution continues replacing older buffered output.
+    NONE = enum.auto()
+    BLOCK = enum.auto()
+    DROP = enum.auto()
 
 
 class _ConnectionInfoBase:
     def __new__(
         cls,
-        *args: typing.Any,
-        **kwargs: typing.Any,
+        *args: t.Any,
+        **kwargs: t.Any,
     ) -> "_ConnectionInfoBase":
         if cls in [_ConnectionInfoBase, ConnectionInfo, AsyncConnectionInfo]:
             raise TypeError(
@@ -44,7 +52,7 @@ class _ConnectionInfoBase:
     def __init__(
         self,
     ) -> None:
-        self.__buffer: typing.Dict[uuid.UUID, bytearray] = {}
+        self.__buffer: t.Dict[uuid.UUID, bytearray] = {}
 
     def get_fragment_size(
         self,
@@ -63,7 +71,7 @@ class _ConnectionInfoBase:
         self,
         pool: ClientRunspacePool,
         buffer: bool = False,
-    ) -> typing.Optional[PSRPPayload]:
+    ) -> t.Optional[PSRPPayload]:
         """Get the next payload.
 
         Get the next payload to exchange if there are any.
@@ -103,13 +111,13 @@ class ConnectionInfo(_ConnectionInfoBase):
     ) -> None:
         super().__init__()
 
-        self.__data_queue: typing.Dict[uuid.UUID, queue.Queue[typing.Optional[PSRPPayload]]] = {}
+        self.__data_queue: t.Dict[uuid.UUID, queue.Queue[t.Optional[PSRPPayload]]] = {}
         self.__queue_lock = threading.Lock()
 
     def queue_response(
         self,
         runspace_pool_id: uuid.UUID,
-        data: typing.Optional[PSRPPayload] = None,
+        data: t.Optional[PSRPPayload] = None,
     ) -> None:
         """Queue received data.
 
@@ -128,7 +136,7 @@ class ConnectionInfo(_ConnectionInfoBase):
     def wait_event(
         self,
         pool: ClientRunspacePool,
-    ) -> typing.Optional[PSRPEvent]:
+    ) -> t.Optional[PSRPEvent]:
         """Get the next PSRP event.
 
         Get the next PSRP event generated from the responses of the peer. It is
@@ -158,7 +166,7 @@ class ConnectionInfo(_ConnectionInfoBase):
     def _get_pool_queue(
         self,
         runspace_pool_id: uuid.UUID,
-    ) -> queue.Queue[typing.Optional[PSRPPayload]]:
+    ) -> queue.Queue[t.Optional[PSRPPayload]]:
         with self.__queue_lock:
             self.__data_queue.setdefault(runspace_pool_id, queue.Queue())
 
@@ -171,7 +179,7 @@ class ConnectionInfo(_ConnectionInfoBase):
     def close(
         self,
         pool: ClientRunspacePool,
-        pipeline_id: typing.Optional[uuid.UUID] = None,
+        pipeline_id: t.Optional[uuid.UUID] = None,
     ) -> None:
         """Close the Runspace Pool/Pipeline.
 
@@ -260,7 +268,7 @@ class ConnectionInfo(_ConnectionInfoBase):
     def signal(
         self,
         pool: ClientRunspacePool,
-        pipeline_id: typing.Optional[uuid.UUID] = None,
+        pipeline_id: uuid.UUID,
     ) -> None:
         """Send a signal to the Runspace Pool/Pipeline
 
@@ -280,7 +288,7 @@ class ConnectionInfo(_ConnectionInfoBase):
     def connect(
         self,
         pool: ClientRunspacePool,
-        pipeline_id: typing.Optional[uuid.UUID] = None,
+        pipeline_id: t.Optional[uuid.UUID] = None,
     ) -> None:
         """Connect to a Runspace Pool/Pipeline.
 
@@ -324,7 +332,7 @@ class ConnectionInfo(_ConnectionInfoBase):
         """
         raise NotImplementedError()
 
-    def enumerate(self) -> typing.Iterator[typing.Tuple[str, typing.List[str]]]:
+    def enumerate(self) -> t.Iterator[t.Tuple[uuid.UUID, t.List[uuid.UUID]]]:
         """Find Runspace Pools or Pipelines.
 
         Find all the Runspace Pools or Pipelines on the connection. This is
@@ -333,9 +341,9 @@ class ConnectionInfo(_ConnectionInfoBase):
         that does not have to be implemented for the core PSRP scenarios.
 
         Returns:
-            Iterable[Tuple[str, List[str]]]: Will yield tuples that contains
-                the Runspace Pool ID with a list of all the pipeline IDs for
-                that Runspace Pool.
+            Iterator[Tuple[uuid.UUID, List[uuid.UUID]]]: Will yield tuples that
+                contains the Runspace Pool ID with a list of all the pipeline
+                IDs for that Runspace Pool.
         """
         raise NotImplementedError()
 
@@ -346,13 +354,13 @@ class AsyncConnectionInfo(_ConnectionInfoBase):
     ) -> None:
         super().__init__()
 
-        self.__data_queue: typing.Dict[uuid.UUID, asyncio.Queue[typing.Optional[PSRPPayload]]] = {}
+        self.__data_queue: t.Dict[uuid.UUID, asyncio.Queue[t.Optional[PSRPPayload]]] = {}
         self.__queue_lock = asyncio.Lock()
 
     async def queue_response(
         self,
         runspace_pool_id: uuid.UUID,
-        data: typing.Optional[PSRPPayload] = None,
+        data: t.Optional[PSRPPayload] = None,
     ) -> None:
         data_queue = await self._get_pool_queue(runspace_pool_id)
         await data_queue.put(data)
@@ -360,7 +368,7 @@ class AsyncConnectionInfo(_ConnectionInfoBase):
     async def wait_event(
         self,
         pool: ClientRunspacePool,
-    ) -> typing.Optional[PSRPEvent]:
+    ) -> t.Optional[PSRPEvent]:
         while True:
             event = pool.next_event()
             if event:
@@ -377,7 +385,7 @@ class AsyncConnectionInfo(_ConnectionInfoBase):
     async def _get_pool_queue(
         self,
         runspace_pool_id: uuid.UUID,
-    ) -> asyncio.Queue[typing.Optional[PSRPPayload]]:
+    ) -> asyncio.Queue[t.Optional[PSRPPayload]]:
         async with self.__queue_lock:
             self.__data_queue.setdefault(runspace_pool_id, asyncio.Queue())
 
@@ -390,7 +398,7 @@ class AsyncConnectionInfo(_ConnectionInfoBase):
     async def close(
         self,
         pool: ClientRunspacePool,
-        pipeline_id: typing.Optional[uuid.UUID] = None,
+        pipeline_id: t.Optional[uuid.UUID] = None,
     ) -> None:
         """Close the Runspace Pool/Pipeline.
 
@@ -479,7 +487,7 @@ class AsyncConnectionInfo(_ConnectionInfoBase):
     async def signal(
         self,
         pool: ClientRunspacePool,
-        pipeline_id: typing.Optional[uuid.UUID] = None,
+        pipeline_id: uuid.UUID,
     ) -> None:
         """Send a signal to the Runspace Pool/Pipeline
 
@@ -499,7 +507,7 @@ class AsyncConnectionInfo(_ConnectionInfoBase):
     async def connect(
         self,
         pool: ClientRunspacePool,
-        pipeline_id: typing.Optional[uuid.UUID] = None,
+        pipeline_id: t.Optional[uuid.UUID] = None,
     ) -> None:
         """Connect to a Runspace Pool/Pipeline.
 
@@ -543,7 +551,7 @@ class AsyncConnectionInfo(_ConnectionInfoBase):
         """
         raise NotImplementedError()
 
-    async def enumerate(self) -> typing.AsyncIterator[typing.Tuple[str, typing.List[str]]]:
+    async def enumerate(self) -> t.AsyncIterator[t.Tuple[uuid.UUID, t.List[uuid.UUID]]]:
         """Find Runspace Pools or Pipelines.
 
         Find all the Runspace Pools or Pipelines on the connection. This is
@@ -552,8 +560,9 @@ class AsyncConnectionInfo(_ConnectionInfoBase):
         that does not have to be implemented for the core PSRP scenarios.
 
         Returns:
-            Iterable[Tuple[str, List[str]]]: Will yield tuples that contains
-                the Runspace Pool ID with a list of all the pipeline IDs for
-                that Runspace Pool.
+            AsyncIterator[Tuple[uuid.UUID, List[uuid.UUID]]]: Will yield tuples
+                that contains the Runspace Pool ID with a list of all the
+                pipeline IDs for that Runspace Pool.
         """
         raise NotImplementedError()
+        yield  # type: ignore[unreachable]  # The yield is needed for mypy to see this as an Iterator

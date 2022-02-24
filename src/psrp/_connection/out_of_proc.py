@@ -6,7 +6,7 @@ import asyncio
 import base64
 import logging
 import threading
-import typing
+import typing as t
 import uuid
 import xml.etree.ElementTree as ElementTree
 
@@ -22,8 +22,8 @@ _EMPTY_UUID = uuid.UUID(int=0)
 class OutOfProcInfo(ConnectionInfo):
     def __new__(
         cls,
-        *args: typing.Any,
-        **kwargs: typing.Any,
+        *args: t.Any,
+        **kwargs: t.Any,
     ) -> "OutOfProcInfo":
         if cls == OutOfProcInfo:
             raise TypeError(
@@ -38,16 +38,16 @@ class OutOfProcInfo(ConnectionInfo):
     ) -> None:
         super().__init__()
 
-        self.__listen_task: typing.Optional[threading.Thread] = None
+        self.__listen_task: t.Optional[threading.Thread] = None
         self.__wait_condition = threading.Condition()
-        self.__wait_table: typing.List[typing.Tuple[str, typing.Optional[uuid.UUID]]] = []
+        self.__wait_table: t.List[t.Tuple[str, t.Optional[uuid.UUID]]] = []
         self.__write_lock = threading.Lock()
 
     #####################
     # OutOfProc Methods #
     #####################
 
-    def read(self) -> typing.Optional[bytes]:
+    def read(self) -> t.Optional[bytes]:
         """Get the response data.
 
         Called by the background thread to read any responses from the peer.
@@ -89,7 +89,7 @@ class OutOfProcInfo(ConnectionInfo):
     def close(
         self,
         pool: ClientRunspacePool,
-        pipeline_id: typing.Optional[uuid.UUID] = None,
+        pipeline_id: t.Optional[uuid.UUID] = None,
     ) -> None:
         with self.__wait_condition:
             with self.__write_lock:
@@ -144,7 +144,7 @@ class OutOfProcInfo(ConnectionInfo):
     def signal(
         self,
         pool: ClientRunspacePool,
-        pipeline_id: typing.Optional[uuid.UUID] = None,
+        pipeline_id: uuid.UUID,
     ) -> None:
         with self.__wait_condition:
             with self.__write_lock:
@@ -154,7 +154,7 @@ class OutOfProcInfo(ConnectionInfo):
     def _wait_ack(
         self,
         action: str,
-        pipeline_id: typing.Optional[uuid.UUID] = None,
+        pipeline_id: t.Optional[uuid.UUID] = None,
     ) -> None:
         key = (f"{action}Ack", pipeline_id)
         self.__wait_table.append(key)
@@ -171,11 +171,11 @@ class OutOfProcInfo(ConnectionInfo):
 
             packet = ElementTree.fromstring(data)
             data = base64.b64decode(packet.text) if packet.text else None
-            ps_guid: typing.Optional[uuid.UUID] = uuid.UUID(packet.attrib["PSGuid"])
+            ps_guid: t.Optional[uuid.UUID] = uuid.UUID(packet.attrib["PSGuid"])
             if ps_guid == _EMPTY_UUID:
                 ps_guid = None
 
-            payload_data: typing.Optional[PSRPPayload] = None
+            payload_data: t.Optional[PSRPPayload] = None
             if data:
                 payload_data = PSRPPayload(data, StreamType.default, ps_guid)
 
@@ -194,8 +194,8 @@ class OutOfProcInfo(ConnectionInfo):
 class AsyncOutOfProcInfo(AsyncConnectionInfo):
     def __new__(
         cls,
-        *args: typing.Any,
-        **kwargs: typing.Any,
+        *args: t.Any,
+        **kwargs: t.Any,
     ) -> "AsyncOutOfProcInfo":
         if cls == AsyncOutOfProcInfo:
             raise TypeError(
@@ -210,16 +210,16 @@ class AsyncOutOfProcInfo(AsyncConnectionInfo):
     ) -> None:
         super().__init__()
 
-        self.__listen_task: typing.Optional[asyncio.Task] = None
+        self.__listen_task: t.Optional[asyncio.Task] = None
         self.__wait_condition = asyncio.Condition()
-        self.__wait_table: typing.List[typing.Tuple[str, typing.Optional[uuid.UUID]]] = []
+        self.__wait_table: t.List[t.Tuple[str, t.Optional[uuid.UUID]]] = []
         self.__write_lock = asyncio.Lock()
 
     #####################
     # OutOfProc Methods #
     #####################
 
-    async def read(self) -> typing.Optional[bytes]:
+    async def read(self) -> t.Optional[bytes]:
         """Get the response data.
 
         Called by the background thread to read any responses from the peer.
@@ -261,7 +261,7 @@ class AsyncOutOfProcInfo(AsyncConnectionInfo):
     async def close(
         self,
         pool: ClientRunspacePool,
-        pipeline_id: typing.Optional[uuid.UUID] = None,
+        pipeline_id: t.Optional[uuid.UUID] = None,
     ) -> None:
         async with self.__wait_condition:
             async with self.__write_lock:
@@ -316,7 +316,7 @@ class AsyncOutOfProcInfo(AsyncConnectionInfo):
     async def signal(
         self,
         pool: ClientRunspacePool,
-        pipeline_id: typing.Optional[uuid.UUID] = None,
+        pipeline_id: uuid.UUID,
     ) -> None:
         async with self.__wait_condition:
             async with self.__write_lock:
@@ -326,7 +326,7 @@ class AsyncOutOfProcInfo(AsyncConnectionInfo):
     async def _wait_ack(
         self,
         action: str,
-        pipeline_id: typing.Optional[uuid.UUID] = None,
+        pipeline_id: t.Optional[uuid.UUID] = None,
     ) -> None:
         key = (f"{action}Ack", pipeline_id)
         self.__wait_table.append(key)
@@ -365,11 +365,11 @@ class AsyncOutOfProcInfo(AsyncConnectionInfo):
                     raise ValueError(f"Failed to parse response: {msg.decode()}") from e
 
                 data = base64.b64decode(packet.text) if packet.text else b""
-                ps_guid: typing.Optional[uuid.UUID] = uuid.UUID(packet.attrib["PSGuid"])
+                ps_guid: t.Optional[uuid.UUID] = uuid.UUID(packet.attrib["PSGuid"])
                 if ps_guid == _EMPTY_UUID:
                     ps_guid = None
 
-                payload_data: typing.Optional[PSRPPayload] = None
+                payload_data: t.Optional[PSRPPayload] = None
                 if data:
                     payload_data = PSRPPayload(data, StreamType.default, ps_guid)
 
@@ -392,7 +392,7 @@ class AsyncOutOfProcInfo(AsyncConnectionInfo):
 def _ps_data_packet(
     data: bytes,
     stream_type: StreamType = StreamType.default,
-    ps_guid: typing.Optional[uuid.UUID] = None,
+    ps_guid: t.Optional[uuid.UUID] = None,
 ) -> bytes:
     """Data packet for PSRP fragments
 
@@ -415,7 +415,7 @@ def _ps_data_packet(
 
 def _ps_guid_packet(
     element: str,
-    ps_guid: typing.Optional[uuid.UUID] = None,
+    ps_guid: t.Optional[uuid.UUID] = None,
 ) -> bytes:
     """Common PSGuid packet for PSRP message.
 

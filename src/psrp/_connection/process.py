@@ -5,7 +5,7 @@
 import asyncio
 import logging
 import subprocess
-import typing
+import typing as t
 
 from psrp._connection.out_of_proc import AsyncOutOfProcInfo, OutOfProcInfo
 
@@ -30,7 +30,7 @@ class ProcessInfo(OutOfProcInfo):
     def __init__(
         self,
         executable: str = "pwsh",
-        arguments: typing.Optional[typing.List[str]] = None,
+        arguments: t.Optional[t.List[str]] = None,
     ) -> None:
         super().__init__()
 
@@ -39,9 +39,9 @@ class ProcessInfo(OutOfProcInfo):
         if executable == "pwsh" and arguments is None:
             self.arguments = ["-NoProfile", "-NoLogo", "-s"]
 
-        self._process: typing.Optional[subprocess.Popen] = None
+        self._process: t.Optional[subprocess.Popen] = None
 
-    def read(self) -> typing.Optional[bytes]:
+    def read(self) -> t.Optional[bytes]:
         if not self._process:
             raise Exception("FIXME: Process not started")
 
@@ -54,7 +54,7 @@ class ProcessInfo(OutOfProcInfo):
         if not self._process:
             raise Exception("FIXME: Process not started")
 
-        writer: typing.IO[typing.Any] = self._process.stdin  # type: ignore[assignment] # Will be set
+        writer: t.IO[t.Any] = self._process.stdin  # type: ignore[assignment] # Will be set
         writer.write(data)
         writer.flush()
 
@@ -89,7 +89,7 @@ class AsyncProcessInfo(AsyncOutOfProcInfo):
     def __init__(
         self,
         executable: str = "pwsh",
-        arguments: typing.Optional[typing.List[str]] = None,
+        arguments: t.Optional[t.List[str]] = None,
     ) -> None:
         super().__init__()
 
@@ -98,9 +98,9 @@ class AsyncProcessInfo(AsyncOutOfProcInfo):
         if executable == "pwsh" and arguments is None:
             self.arguments = ["-NoProfile", "-NoLogo", "-s"]
 
-        self._process: typing.Optional[asyncio.subprocess.Process] = None
+        self._process: t.Optional[asyncio.subprocess.Process] = None
 
-    async def read(self) -> typing.Optional[bytes]:
+    async def read(self) -> t.Optional[bytes]:
         if not self._process:
             raise Exception("FIXME: Process not started")
 
