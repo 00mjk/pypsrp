@@ -291,7 +291,7 @@ class WSManInfo(ConnectionInfo):
 
                 for psrp_data in event.streams.get("stdout", []):
                     msg = PSRPPayload(psrp_data, StreamType.default, pipeline_id)
-                    self.queue_response(pool.runspace_pool_id, msg)
+                    self.process_response(pool, msg)
 
                 # If the command is done then we've got nothing left to do here.
                 # TODO: do we need to surface the exit_code into the protocol.
@@ -299,7 +299,7 @@ class WSManInfo(ConnectionInfo):
                     break
 
             if pipeline_id is None:
-                self.queue_response(pool.runspace_pool_id, None)
+                self.process_response(pool, None)
 
 
 class AsyncWSManInfo(AsyncConnectionInfo):
@@ -504,8 +504,7 @@ class AsyncWSManInfo(AsyncConnectionInfo):
         resp = await self._connection.post(winrs.data_to_send())
         winrs.receive_data(resp)
 
-    # No idea why mypy doesn't like this, it's the same signature as the parent
-    async def enumerate(self) -> t.AsyncIterator[t.Tuple[uuid.UUID, t.List[uuid.UUID]]]:  # type: ignore[override]
+    async def enumerate(self) -> t.AsyncIterator[t.Tuple[uuid.UUID, t.List[uuid.UUID]]]:
         wsman = WSMan(self._connection_uri)
         enumerate_winrs(wsman)
         resp = await self._connection.post(wsman.data_to_send())
@@ -566,7 +565,7 @@ class AsyncWSManInfo(AsyncConnectionInfo):
 
                 for psrp_data in event.streams.get("stdout", []):
                     msg = PSRPPayload(psrp_data, StreamType.default, pipeline_id)
-                    await self.queue_response(pool.runspace_pool_id, msg)
+                    await self.process_response(pool, msg)
 
                 # If the command is done then we've got nothing left to do here.
                 # TODO: do we need to surface the exit_code into the protocol.
@@ -574,4 +573,4 @@ class AsyncWSManInfo(AsyncConnectionInfo):
                     break
 
             if pipeline_id is None:
-                await self.queue_response(pool.runspace_pool_id, None)
+                await self.process_response(pool, None)

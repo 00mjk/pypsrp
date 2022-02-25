@@ -111,66 +111,55 @@ class ConnectionInfo(_ConnectionInfoBase):
     ) -> None:
         super().__init__()
 
-        self.__data_queue: t.Dict[uuid.UUID, queue.Queue[t.Optional[PSRPPayload]]] = {}
-        self.__queue_lock = threading.Lock()
+        self.__event_callback: t.Dict[uuid.UUID, t.Callable[[PSRPEvent], None]] = {}
 
-    def queue_response(
+    def register_pool_callback(
         self,
         runspace_pool_id: uuid.UUID,
-        data: t.Optional[PSRPPayload] = None,
+        callback: t.Callable[[PSRPEvent], None],
     ) -> None:
-        """Queue received data.
+        """Register callback function for pool.
 
-        Queues the data received from the peer into the internal message queue
-        for later processing. It is up to the implementing class to retrieve
-        the data and queue it with this method.
+        Registers the callback function for a Runspace Pool that is called when
+        a new PSRP event is available.
 
         Args:
-            runspace_pool_id: The Runspace Pool ID the data is associated with.
-            data: The data to queue, can be set to `None` to indicate no more
-                data is expected.
+            runspace_pool_id: The Runspace Pool identifier to register the
+                callback on.
+            callback: The function to invoke when a new event is available.
         """
-        data_queue = self._get_pool_queue(runspace_pool_id)
-        data_queue.put(data)
+        self.__event_callback[runspace_pool_id] = callback
 
-    def wait_event(
+    def process_response(
         self,
         pool: ClientRunspacePool,
-    ) -> t.Optional[PSRPEvent]:
-        """Get the next PSRP event.
+        data: t.Optional[PSRPPayload] = None,
+    ) -> None:
+        """Process an incoming PSRP payload.
 
-        Get the next PSRP event generated from the responses of the peer. It is
-        up to the implementing class to retrieve the data and queue it so
-        events can be generated.
+        Processes any incoming PSRP payload received from the peer and invokes
+        the pool callback function for any PSRP events inside that payload.
 
         Args:
-            pool: The Runspace Pool to get the next event for.
-
-        Returns:
-            Optional[PSRPEvent]: The PSRPEvent or `None` if the Runspace Pool
-                has been closed with no more events expected.
+            pool: The Runspace Pool the payload is for.
+            data: The PSRPPayload to process. Will be None to signify no more
+                data is expected for this pool.
         """
+        callback = self.__event_callback[pool.runspace_pool_id]
+
+        if data:
+            log.debug("PSRP Receive", data.data)
+            pool.receive_data(data)
+
+        else:
+            del self.__event_callback[pool.runspace_pool_id]
+
         while True:
             event = pool.next_event()
-            if event:
-                return event
+            if not event:
+                break
 
-            data_queue = self._get_pool_queue(pool.runspace_pool_id)
-            msg = data_queue.get()
-            if msg is None:
-                return None
-
-            log.debug("PSRP Receive", msg.data)
-            pool.receive_data(msg)
-
-    def _get_pool_queue(
-        self,
-        runspace_pool_id: uuid.UUID,
-    ) -> queue.Queue[t.Optional[PSRPPayload]]:
-        with self.__queue_lock:
-            self.__data_queue.setdefault(runspace_pool_id, queue.Queue())
-
-        return self.__data_queue[runspace_pool_id]
+            callback(event)
 
     ################
     # PSRP Methods #
@@ -354,42 +343,55 @@ class AsyncConnectionInfo(_ConnectionInfoBase):
     ) -> None:
         super().__init__()
 
-        self.__data_queue: t.Dict[uuid.UUID, asyncio.Queue[t.Optional[PSRPPayload]]] = {}
-        self.__queue_lock = asyncio.Lock()
+        self.__event_callback: t.Dict[uuid.UUID, t.Callable[[PSRPEvent], t.Coroutine]] = {}
 
-    async def queue_response(
+    def register_pool_callback(
         self,
         runspace_pool_id: uuid.UUID,
-        data: t.Optional[PSRPPayload] = None,
+        callback: t.Callable[[PSRPEvent], t.Coroutine],
     ) -> None:
-        data_queue = await self._get_pool_queue(runspace_pool_id)
-        await data_queue.put(data)
+        """Register callback coroutine for pool.
 
-    async def wait_event(
+        Registers the callback coroutine for a Runspace Pool that is called
+        when a new PSRP event is available.
+
+        Args:
+            runspace_pool_id: The Runspace Pool identifier to register the
+                callback on.
+            callback: The coroutine to invoke when a new event is available.
+        """
+        self.__event_callback[runspace_pool_id] = callback
+
+    async def process_response(
         self,
         pool: ClientRunspacePool,
-    ) -> t.Optional[PSRPEvent]:
+        data: t.Optional[PSRPPayload] = None,
+    ) -> None:
+        """Process an incoming PSRP payload.
+
+        Processes any incoming PSRP payload received from the peer and invokes
+        the pool callback coroutine for any PSRP events inside that payload.
+
+        Args:
+            pool: The Runspace Pool the payload is for.
+            data: The PSRPPayload to process. Will be None to signify no more
+                data is expected for this pool.
+        """
+        callback = self.__event_callback[pool.runspace_pool_id]
+
+        if data:
+            log.debug("PSRP Receive", data.data)
+            pool.receive_data(data)
+
+        else:
+            del self.__event_callback[pool.runspace_pool_id]
+
         while True:
             event = pool.next_event()
-            if event:
-                return event
+            if not event:
+                break
 
-            data_queue = await self._get_pool_queue(pool.runspace_pool_id)
-            msg = await data_queue.get()
-            if msg is None:
-                return None
-
-            log.debug("PSRP Receive", msg.data)
-            pool.receive_data(msg)
-
-    async def _get_pool_queue(
-        self,
-        runspace_pool_id: uuid.UUID,
-    ) -> asyncio.Queue[t.Optional[PSRPPayload]]:
-        async with self.__queue_lock:
-            self.__data_queue.setdefault(runspace_pool_id, asyncio.Queue())
-
-        return self.__data_queue[runspace_pool_id]
+            await callback(event)
 
     ################
     # PSRP Methods #

@@ -181,14 +181,14 @@ class OutOfProcInfo(ConnectionInfo):
 
             tag = packet.tag
             if tag == "Data":
-                self.queue_response(pool.runspace_pool_id, payload_data)
+                self.process_response(pool, payload_data)
 
             else:
                 with self.__wait_condition:
                     self.__wait_table.remove((tag, ps_guid))
                     self.__wait_condition.notify_all()
 
-        self.queue_response(pool.runspace_pool_id, None)
+        self.process_response(pool, None)
 
 
 class AsyncOutOfProcInfo(AsyncConnectionInfo):
@@ -373,17 +373,16 @@ class AsyncOutOfProcInfo(AsyncConnectionInfo):
                 if data:
                     payload_data = PSRPPayload(data, StreamType.default, ps_guid)
 
-                tag = packet.tag
-                if tag == "Data":
-                    await self.queue_response(pool.runspace_pool_id, payload_data)
+                if packet.tag == "Data":
+                    await self.process_response(pool, payload_data)
 
                 else:
                     async with self.__wait_condition:
-                        self.__wait_table.remove((tag, ps_guid))
+                        self.__wait_table.remove((packet.tag, ps_guid))
                         self.__wait_condition.notify_all()
 
         finally:
-            await self.queue_response(pool.runspace_pool_id, None)
+            await self.process_response(pool, None)
             async with self.__wait_condition:
                 self.__wait_table = []
                 self.__wait_condition.notify_all()

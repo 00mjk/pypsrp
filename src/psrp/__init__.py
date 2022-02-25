@@ -5,7 +5,7 @@
 from psrp._async import (
     AsyncCommandMetaPipeline,
     AsyncPowerShell,
-    AsyncPSDataStream,
+    AsyncPSDataCollection,
     AsyncRunspacePool,
 )
 from psrp._connection.connection_info import (
@@ -26,7 +26,7 @@ __all__ = [
     "AsyncOutOfProcInfo",
     "AsyncPowerShell",
     "AsyncProcessInfo",
-    "AsyncPSDataStream",
+    "AsyncPSDataCollection",
     "AsyncRunspacePool",
     "AsyncSSHInfo",
     "AsyncWSManInfo",

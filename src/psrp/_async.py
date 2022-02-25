@@ -3,7 +3,6 @@
 # MIT License (see LICENSE or https://opensource.org/licenses/MIT)
 
 import asyncio
-import contextlib
 import typing as t
 import uuid
 
@@ -12,25 +11,40 @@ from psrpcore import (
     ClientPowerShell,
     ClientRunspacePool,
     Command,
+    DebugRecordEvent,
+    ErrorRecordEvent,
     GetRunspaceAvailabilityEvent,
+    InformationRecordEvent,
     MissingCipherError,
     PipelineHostCallEvent,
+    PipelineOutputEvent,
+    PipelineStateEvent,
+    ProgressRecordEvent,
     PSRPEvent,
     RunspacePoolHostCallEvent,
+    RunspacePoolStateEvent,
     SetRunspaceAvailabilityEvent,
+    UserEventEvent,
+    VerboseRecordEvent,
+    WarningRecordEvent,
 )
 from psrpcore.types import (
     ApartmentState,
     CommandTypes,
+    DebugRecord,
     ErrorCategoryInfo,
     ErrorRecord,
+    InformationRecord,
     NETException,
+    ProgressRecord,
     PSInvocationState,
     PSObject,
     PSRPMessageType,
     PSThreadOptions,
     RemoteStreamOptions,
     RunspacePoolState,
+    VerboseRecord,
+    WarningRecord,
 )
 
 from ._compat import iscoroutinefunction
@@ -58,77 +72,121 @@ async def _invoke_async(
         return func(*args, **kwargs)
 
 
-class AsyncPSDataStream(list):
-    """Collection for a PowerShell stream.
-
-    This is a list of PowerShell objects for a PowerShell pipeline stream.
-    This acts like a normal list but includes the `:meth:wait()` which can be
-    used to asynchronously wait for any new objects to be added.
-    """
-
+class AsyncPSDataCollection(t.Generic[T2], t.List[T2]):
     def __init__(
         self,
         *args: t.Any,
+        blocking_iterator: bool = False,
         **kwargs: t.Any,
     ) -> None:
         super().__init__(*args, **kwargs)
-        self._added_idx: asyncio.Queue[t.Optional[int]] = asyncio.Queue()
-        self._complete = False
+        self.completed = AsyncEvent[bool]()
+        self.data_added = AsyncEvent[T2]()
+        self.data_adding = AsyncEvent[T2]()
+        self.blocking_iterator = blocking_iterator
+        self._completed = False
+        self._add_condition = asyncio.Condition()
 
-    def __aiter__(self) -> "AsyncPSDataStream":
-        return self
+    def __add__(
+        self,
+        value: t.List[T2],
+    ) -> t.List[T2]:
+        if self._completed:
+            raise ValueError("FIXME: Better error when adding on completed stream")
+        return super().__add__(value)
 
-    async def __anext__(self) -> t.Any:
-        val = await self.wait()
-        if self._complete:
-            raise StopAsyncIteration
-
-        return val
+    def __aiter__(
+        self,
+    ) -> t.AsyncIterator[T2]:
+        return self._aiter_next()
 
     def append(
         self,
-        value: t.Any,
+        value: T2,
     ) -> None:
-        if not self._complete:
-            super().append(value)
-            self._added_idx.put_nowait(len(self) - 1)
+        if self._completed:
+            raise ValueError("FIXME: Better error when appending on completed stream")
+        return super().append(value)
 
-    def finalize(self) -> None:
-        if not self._complete:
-            self._added_idx.put_nowait(None)
+    async def complete(self) -> None:
+        self._completed = True
+        await self.completed(True)
 
-    async def wait(self) -> t.Optional[t.Any]:
-        """Wait for a new entry.
+    def insert(
+        self,
+        index: t.SupportsIndex,
+        value: T2,
+    ) -> None:
+        if self._completed:
+            raise ValueError("FIXME: Better error when inserting on completed stream")
+        return super().insert(index, value)
 
-        Waits for a new object to be added to the stream and returns that object once it is added.
+    async def _append(
+        self,
+        value: T2,
+    ) -> None:
+        await self.data_adding(value)
 
-        Returns:
-            t.Optional[PSObject]: The PSObject added or `None`. If the queue has been finalized then `None` is
-                also returned.
-        """
-        if self._complete:
-            return None
+        async with self._add_condition:
+            self.append(value)
+            self._add_condition.notify_all()
 
-        idx = await self._added_idx.get()
-        if idx is None:
-            self._complete = True
-            return None
+        await self.data_added(value)
 
-        return self[idx]
+    async def _aiter_next(self) -> t.AsyncIterator[T2]:
+        idx = 0
+        while True:
+            async with self._add_condition:
+                if idx < len(self):
+                    value = self[idx]
+                    idx += 1
+                    yield value
+
+                elif self._completed or not self.blocking_iterator:
+                    break
+
+                else:
+                    await self._add_condition.wait()
 
 
 class AsyncPipelineTask:
     def __init__(
         self,
         completed: asyncio.Event,
-        output_stream: t.Optional[AsyncPSDataStream] = None,
+        output_stream: t.Optional[AsyncPSDataCollection[t.Any]] = None,
     ) -> None:
         self._completed = completed
         self._output_stream = output_stream
 
-    async def wait(self) -> t.Optional[AsyncPSDataStream]:
+    async def wait(self) -> t.Optional[AsyncPSDataCollection[t.Any]]:
         await self._completed.wait()
         return self._output_stream
+
+
+class AsyncEvent(t.Generic[T2]):
+    def __init__(self) -> None:
+        self._callbacks: t.List[t.Callable[[T2], t.Awaitable[None]]] = []
+
+    async def __call__(
+        self,
+        event: T2,
+    ) -> None:
+        for callback in self._callbacks:
+            await callback(event)
+
+    def __iadd__(
+        self,
+        value: t.Callable[[T2], t.Awaitable[None]],
+    ) -> "AsyncEvent[T2]":
+        self._callbacks.append(value)
+        return self
+
+    def __isub__(
+        self,
+        value: t.Callable[[T2], t.Awaitable[None]],
+    ) -> "AsyncEvent[T2]":
+        self._callbacks.remove(value)
+        return self
 
 
 class AsyncRunspacePool:
@@ -146,6 +204,8 @@ class AsyncRunspacePool:
         self.connection = connection
         self.host = host
         self.pipeline_table: t.Dict[uuid.UUID, AsyncPipeline] = {}
+        self.state_changed = AsyncEvent[RunspacePoolStateEvent]()
+        self.user_event = AsyncEvent[UserEventEvent]()
 
         self._new_client = False  # Used for reconnection as a new client.
         self._pool = ClientRunspacePool(
@@ -157,11 +217,21 @@ class AsyncRunspacePool:
             application_arguments=application_arguments,
             runspace_pool_id=runspace_pool_id,
         )
-        self._ci_table = {}
-        self._event_task = None
-        self._registrations: t.Dict[
-            PSRPMessageType, t.List[t.Union[asyncio.Condition, t.Callable[[PSRPEvent], None]]]
-        ] = {mt: [asyncio.Condition()] for mt in PSRPMessageType}
+        self.connection.register_pool_callback(self._pool.runspace_pool_id, self._event_received)
+
+        self._ci_get_availability: t.Dict[int, GetRunspaceAvailabilityEvent] = {}
+        self._ci_set_availability: t.Dict[int, SetRunspaceAvailabilityEvent] = {}
+        self._event_conditions: t.Dict[PSRPMessageType, asyncio.Condition] = {
+            mt: asyncio.Condition()
+            for mt in [
+                PSRPMessageType.ApplicationPrivateData,
+                PSRPMessageType.EncryptedSessionKey,
+                PSRPMessageType.RunspaceAvailability,
+                PSRPMessageType.RunspacePoolInitData,
+                PSRPMessageType.RunspacePoolState,
+                PSRPMessageType.SessionCapability,
+            ]
+        }
 
     async def __aenter__(self) -> "AsyncRunspacePool":
         if self.state == RunspacePoolState.Disconnected:
@@ -191,6 +261,10 @@ class AsyncRunspacePool:
     def state(self) -> RunspacePoolState:
         return self._pool.state
 
+    @property
+    def application_private_data(self) -> t.Dict[str, t.Any]:
+        return self._pool.application_private_data
+
     @classmethod
     async def get_runspace_pools(
         cls,
@@ -215,41 +289,39 @@ class AsyncRunspacePool:
 
     async def connect(self) -> None:
         if self._new_client:
-            self._pool.connect()
-            await self.connection.connect(self._pool)
+            sess_condition = self._event_conditions[PSRPMessageType.SessionCapability]
+            init_condition = self._event_conditions[PSRPMessageType.InitRunspacePool]
+            data_condition = self._event_conditions[PSRPMessageType.ApplicationPrivateData]
 
-            async with self._wait_condition(PSRPMessageType.SessionCapability) as sess, self._wait_condition(
-                PSRPMessageType.RunspacePoolInitData
-            ) as init, self._wait_condition(PSRPMessageType.ApplicationPrivateData) as data:
+            async with sess_condition, init_condition, data_condition:
+                self._pool.connect()
+                await self.connection.connect(self._pool)
+                await sess_condition.wait()
+                await init_condition.wait()
+                await data_condition.wait()
 
-                self._event_task = asyncio.create_task(self._response_listener())
-                await sess.wait()
-                await init.wait()
-                await data.wait()
             self._new_client = False
 
         else:
             await self.connection.reconnect(self._pool)
-            self._event_task = asyncio.create_task(self._response_listener())
 
         self._pool.state = RunspacePoolState.Opened
 
     async def open(self) -> None:
         self._pool.open()
-        await self.connection.create(self._pool)
 
-        async with self._wait_condition(PSRPMessageType.RunspacePoolState) as cond:
-            self._event_task = asyncio.create_task(self._response_listener())
-            await cond.wait()
+        condition = self._event_conditions[PSRPMessageType.RunspacePoolState]
+        async with condition:
+            await self.connection.create(self._pool)
+            await condition.wait()
 
     async def close(self) -> None:
         if self.state != RunspacePoolState.Disconnected:
-            tasks = [p.close() for p in self.pipeline_table.values()] + [self.connection.close(self._pool)]
-            async with self._wait_condition(PSRPMessageType.RunspacePoolState) as cond:
+            condition = self._event_conditions[PSRPMessageType.RunspacePoolState]
+            async with condition:
+                tasks = [p.close() for p in self.pipeline_table.values()] + [self.connection.close(self._pool)]
                 await asyncio.gather(*tasks)
-                await cond.wait_for(lambda: self.state != RunspacePoolState.Opened)
-
-        await asyncio.gather(self._event_task)
+                await condition.wait_for(lambda: self.state != RunspacePoolState.Opened)
 
     async def disconnect(self) -> None:
         self._pool.state = RunspacePoolState.Disconnecting
@@ -260,113 +332,82 @@ class AsyncRunspacePool:
             pipeline.pipeline.state = PSInvocationState.Disconnected
 
     async def exchange_key(self) -> None:
-        self._pool.exchange_key()
-        await self._send_and_wait_for(PSRPMessageType.EncryptedSessionKey)
+        condition = self._event_conditions[PSRPMessageType.EncryptedSessionKey]
+        async with condition:
+            self._pool.exchange_key()
+            await self.connection.send_all(self._pool)
+            await condition.wait()
 
     async def reset_runspace_state(self) -> bool:
         ci = self._pool.reset_runspace_state()
-        return await self._validate_runspace_availability(ci)
+        return await self._send_set_runspace_availability_ci(ci)
 
     async def set_max_runspaces(
         self,
         value: int,
     ) -> bool:
         ci = self._pool.set_max_runspaces(value)
-        return await self._validate_runspace_availability(ci)
+        return await self._send_set_runspace_availability_ci(ci)
 
     async def set_min_runspaces(
         self,
         value: int,
     ) -> bool:
         ci = self._pool.set_min_runspaces(value)
-        return await self._validate_runspace_availability(ci)
+        return await self._send_set_runspace_availability_ci(ci)
 
     async def get_available_runspaces(self) -> int:
         ci = self._pool.get_available_runspaces()
 
-        await self._send_and_wait_for(
-            PSRPMessageType.RunspaceAvailability,
-            lambda: ci in self._ci_table,
-        )
+        condition = self._event_conditions[PSRPMessageType.RunspaceAvailability]
+        async with condition:
+            await self.connection.send_all(self._pool)
+            await condition.wait_for(lambda: ci in self._ci_get_availability)
 
-        return self._ci_table.pop(ci).count
+        return self._ci_get_availability.pop(ci).count
 
-    def _get_event_registrations(
+    async def _event_received(
         self,
         event: PSRPEvent,
-    ) -> t.List:
-        if isinstance(
-            event,
-            (
-                PipelineHostCallEvent,
-                GetRunspaceAvailabilityEvent,
-                SetRunspaceAvailabilityEvent,
-                RunspacePoolHostCallEvent,
-            ),
-        ):
-            self._ci_table[int(event.ci)] = event
-
+    ) -> None:
         if event.pipeline_id:
             pipeline = self.pipeline_table[event.pipeline_id]
-            reg_table = pipeline._registrations
+            await pipeline._event_received(event)
+            return
 
-        else:
-            reg_table = self._registrations
+        if isinstance(event, RunspacePoolStateEvent):
+            await self.state_changed(event)
 
-        return reg_table[event.message_type]
+        elif isinstance(event, UserEventEvent):
+            await self.user_event(event)
 
-    async def _response_listener(self) -> None:
-        while True:
-            event = await self.connection.wait_event(self._pool)
-            if event is None:
-                return
+        elif isinstance(event, GetRunspaceAvailabilityEvent):
+            self._ci_get_availability[event.ci] = event
 
-            registrations = self._get_event_registrations(event)
-            for reg in registrations:
-                if isinstance(reg, asyncio.Condition):
-                    async with reg:
-                        reg.notify_all()
+        elif isinstance(event, SetRunspaceAvailabilityEvent):
+            self._ci_set_availability[event.ci] = event
 
-                    continue
+        elif isinstance(event, RunspacePoolHostCallEvent):
+            raise NotImplementedError("Call PSHost method")
 
-                try:
-                    await _invoke_async(reg, event)
+        condition = self._event_conditions.get(event.message_type, None)
+        if condition:
+            async with condition:
+                condition.notify_all()
 
-                except Exception as e:
-                    # FIXM#E: log.warning this
-                    print(f"Error running registered callback: {e!s}")
-
-    async def _send_and_wait_for(
-        self,
-        message_type: PSRPMessageType,
-        predicate: t.Optional[t.Callable] = None,
-    ) -> None:
-        async with self._wait_condition(message_type) as cond:
-            await self.connection.send_all(self._pool)
-            await (cond.wait_for(predicate) if predicate else cond.wait())
-
-    async def _validate_runspace_availability(
+    async def _send_set_runspace_availability_ci(
         self,
         ci: t.Optional[int],
     ) -> bool:
         if ci is None:
             return True
 
-        await self._send_and_wait_for(
-            PSRPMessageType.RunspaceAvailability,
-            lambda: ci in self._ci_table,
-        )
+        condition = self._event_conditions[PSRPMessageType.RunspaceAvailability]
+        async with condition:
+            await self.connection.send_all(self._pool)
+            await condition.wait_for(lambda: ci in self._ci_set_availability)
 
-        return self._ci_table.pop(ci).success
-
-    @contextlib.asynccontextmanager
-    async def _wait_condition(
-        self,
-        message_type: PSRPMessageType,
-    ) -> t.AsyncIterable[asyncio.Condition]:
-        cond = self._registrations[message_type][0]
-        async with cond:
-            yield cond
+        return self._ci_set_availability.pop(ci).success
 
 
 class AsyncPipeline(t.Generic[T1]):
@@ -377,33 +418,21 @@ class AsyncPipeline(t.Generic[T1]):
     ) -> None:
         self.runspace_pool = runspace_pool
         self.pipeline: T1 = pipeline
-        self.streams: t.Dict[str, AsyncPSDataStream] = {}
+        self.state_changed = AsyncEvent[PipelineStateEvent]()
+        self.stream_debug = AsyncPSDataCollection[DebugRecord]()
+        self.stream_error = AsyncPSDataCollection[ErrorRecord]()
+        self.stream_information = AsyncPSDataCollection[InformationRecord]()
+        self.stream_progress = AsyncPSDataCollection[ProgressRecord]()
+        self.stream_verbose = AsyncPSDataCollection[VerboseRecord]()
+        self.stream_warning = AsyncPSDataCollection[WarningRecord]()
+        self._stream_output: t.Optional[AsyncPSDataCollection[t.Any]] = None
 
-        self._output_stream: t.Optional[AsyncPSDataStream] = None
-        self._completed: t.Optional[asyncio.Event] = None
-        self._completed_stop: t.Optional[asyncio.Event] = None
-        self._host_tasks: t.Dict[int, t.Any] = {}
-        self._close_lock = asyncio.Lock()
-
-        self._registrations: t.Dict[
-            PSRPMessageType, t.List[t.Union[asyncio.Condition, t.Callable[[PSRPEvent], None]]]
-        ] = {mt: [asyncio.Condition()] for mt in PSRPMessageType}
-
-        self._registrations[PSRPMessageType.PipelineState].append(self._on_state)
-        self._registrations[PSRPMessageType.PipelineHostCall].append(self._on_host_call)
-        self._registrations[PSRPMessageType.PipelineOutput].append(lambda e: self._output_stream.append(e.data))
-
-        for name, mt in [
-            ("debug", PSRPMessageType.DebugRecord),
-            ("error", PSRPMessageType.ErrorRecord),
-            ("information", PSRPMessageType.InformationRecord),
-            ("progress", PSRPMessageType.ProgressRecord),
-            ("verbose", PSRPMessageType.VerboseRecord),
-            ("warning", PSRPMessageType.WarningRecord),
-        ]:
-            stream = AsyncPSDataStream()
-            self.streams[name] = stream
-            self._registrations[mt].append(lambda e: stream.append(e.record))
+        self._event_conditions: t.Dict[PSRPMessageType, asyncio.Condition] = {
+            mt: asyncio.Condition()
+            for mt in [
+                PSRPMessageType.PipelineState,
+            ]
+        }
 
     @property
     def had_errors(self) -> bool:
@@ -434,7 +463,7 @@ class AsyncPipeline(t.Generic[T1]):
 
     async def connect_async(
         self,
-        output_stream: t.Optional[AsyncPSDataStream] = None,
+        output_stream: t.Optional[AsyncPSDataCollection[t.Any]] = None,
         completed: t.Optional[asyncio.Event] = None,
     ) -> AsyncPipelineTask:
         task = self._new_task(output_stream, completed)
@@ -450,7 +479,7 @@ class AsyncPipeline(t.Generic[T1]):
     async def invoke(
         self,
         input_data: t.Optional[t.Union[t.Iterable, t.AsyncIterable]] = None,
-        output_stream: t.Optional[AsyncPSDataStream] = None,
+        output_stream: t.Optional[AsyncPSDataCollection[t.Any]] = None,
         buffer_input: bool = True,
     ) -> t.Optional[t.AsyncIterable[t.Optional[PSObject]]]:
         """Invoke the pipeline.
@@ -473,7 +502,7 @@ class AsyncPipeline(t.Generic[T1]):
     async def invoke_async(
         self,
         input_data: t.Optional[t.Union[t.Iterable, t.AsyncIterable]] = None,
-        output_stream: t.Optional[AsyncPSDataStream] = None,
+        output_stream: t.Optional[AsyncPSDataCollection[t.Any]] = None,
         completed: t.Optional[asyncio.Event] = None,
         buffer_input: bool = True,
     ) -> AsyncPipelineTask:
@@ -551,38 +580,52 @@ class AsyncPipeline(t.Generic[T1]):
 
         return task
 
-    async def _on_state(
+    async def _event_received(
         self,
         event: PSRPEvent,
     ) -> None:
-        try:
-            await self.close()
+        if isinstance(event, PipelineStateEvent):
+            # TODO: Need to close the pipeline
+            await self.state_changed(event)
 
-        finally:
-            for stream in self.streams.values():
-                stream.finalize()
+        elif isinstance(event, PipelineHostCallEvent):
+            await self._on_host_call(event)
 
-            if self._output_stream:
-                self._output_stream.finalize()
-                self._output_stream = None
+        elif isinstance(event, PipelineOutputEvent):
+            raise NotImplementedError("Output stream")  # event.data
 
-            if self._completed:
-                self._completed.set()
-                self._completed = None
+        elif isinstance(event, DebugRecordEvent):
+            await self.stream_debug._append(event.record)
 
-            if self._completed_stop:
-                self._completed_stop.set()
-                self._completed_stop = None
+        elif isinstance(event, ErrorRecordEvent):
+            await self.stream_error._append(event.record)
+
+        elif isinstance(event, InformationRecordEvent):
+            await self.stream_information._append(event.record)
+
+        elif isinstance(event, ProgressRecordEvent):
+            await self.stream_progress._append(event.record)
+
+        elif isinstance(event, VerboseRecordEvent):
+            await self.stream_verbose._append(event.record)
+
+        elif isinstance(event, WarningRecordEvent):
+            await self.stream_warning._append(event.record)
+
+        condition = self._event_conditions.get(event.message_type, None)
+        if condition:
+            async with condition:
+                condition.notify_all()
 
     def _new_task(
         self,
-        output_stream: t.Optional[AsyncPSDataStream] = None,
+        output_stream: t.Optional[AsyncPSDataCollection[t.Any]] = None,
         completed: t.Optional[asyncio.Event] = None,
         for_stop: bool = False,
     ) -> AsyncPipelineTask:
         task_output = None
         if not output_stream:
-            output_stream = task_output = AsyncPSDataStream()
+            output_stream = task_output = AsyncPSDataCollection[t.Any]()
         self._output_stream = output_stream
 
         completed = completed or asyncio.Event()
@@ -597,7 +640,7 @@ class AsyncPipeline(t.Generic[T1]):
 
     async def _on_host_call(
         self,
-        event: PSRPEvent,
+        event: PipelineHostCallEvent,
     ) -> None:
         host = getattr(self, "host", None) or self.runspace_pool.host
 
@@ -630,7 +673,7 @@ class AsyncPipeline(t.Generic[T1]):
 
             if method_metadata.is_void:
                 # PowerShell continues on even if the exception was on the client host
-                self.streams["error"].append(error_record)
+                await self.stream_error._append(error_record)
                 return
 
         if not method_metadata.is_void:
@@ -705,7 +748,7 @@ class AsyncPowerShell(AsyncPipeline[ClientPowerShell]):
     async def invoke_async(
         self,
         input_data: t.Optional[t.Union[t.Iterable, t.AsyncIterable]] = None,
-        output_stream: t.Optional[AsyncPSDataStream] = None,
+        output_stream: t.Optional[AsyncPSDataCollection[t.Any]] = None,
         completed: t.Optional[asyncio.Event] = None,
         buffer_input: bool = True,
     ) -> AsyncPipelineTask:
