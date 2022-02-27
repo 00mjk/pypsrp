@@ -38,7 +38,6 @@ from psrpcore.types import (
     NETException,
     ProgressRecord,
     PSInvocationState,
-    PSObject,
     PSRPMessageType,
     PSThreadOptions,
     RemoteStreamOptions,
@@ -53,23 +52,6 @@ from ._host import PSHost, get_host_method
 
 T1 = t.TypeVar("T1", bound=t.Union[ClientGetCommandMetadata, ClientPowerShell])
 T2 = t.TypeVar("T2")
-
-
-def _not_implemented() -> None:
-    raise NotImplementedError()
-
-
-async def _invoke_async(
-    func: t.Callable[..., T2],
-    *args: t.Any,
-    **kwargs: t.Any,
-) -> T2:
-    if iscoroutinefunction(func):
-        res = await func(*args, **kwargs)  # type: ignore[misc] # Not sure how else to document this
-        return t.cast(T2, res)
-
-    else:
-        return func(*args, **kwargs)
 
 
 class AsyncPSDataCollection(t.Generic[T2], t.List[T2]):
@@ -149,20 +131,6 @@ class AsyncPSDataCollection(t.Generic[T2], t.List[T2]):
                     await self._add_condition.wait()
 
 
-class AsyncPipelineTask:
-    def __init__(
-        self,
-        completed: asyncio.Event,
-        output_stream: t.Optional[AsyncPSDataCollection[t.Any]] = None,
-    ) -> None:
-        self._completed = completed
-        self._output_stream = output_stream
-
-    async def wait(self) -> t.Optional[AsyncPSDataCollection[t.Any]]:
-        await self._completed.wait()
-        return self._output_stream
-
-
 class AsyncEvent(t.Generic[T2]):
     def __init__(self) -> None:
         self._callbacks: t.List[t.Callable[[T2], t.Awaitable[None]]] = []
@@ -206,6 +174,12 @@ class AsyncRunspacePool:
         self.pipeline_table: t.Dict[uuid.UUID, AsyncPipeline] = {}
         self.state_changed = AsyncEvent[RunspacePoolStateEvent]()
         self.user_event = AsyncEvent[UserEventEvent]()
+        self.stream_debug = AsyncPSDataCollection[DebugRecord]()
+        self.stream_error = AsyncPSDataCollection[ErrorRecord]()
+        self.stream_information = AsyncPSDataCollection[InformationRecord]()
+        self.stream_progress = AsyncPSDataCollection[ProgressRecord]()
+        self.stream_verbose = AsyncPSDataCollection[VerboseRecord]()
+        self.stream_warning = AsyncPSDataCollection[WarningRecord]()
 
         self._new_client = False  # Used for reconnection as a new client.
         self._pool = ClientRunspacePool(
@@ -387,13 +361,79 @@ class AsyncRunspacePool:
         elif isinstance(event, SetRunspaceAvailabilityEvent):
             self._ci_set_availability[event.ci] = event
 
-        elif isinstance(event, RunspacePoolHostCallEvent):
-            raise NotImplementedError("Call PSHost method")
+        elif isinstance(event, RunspacePoolHostCallEvent) and self.host:
+            await self._invoke_host_call(self.host, event, self.stream_error)
+
+        elif isinstance(event, DebugRecordEvent):
+            await self.stream_debug._append(event.record)
+
+        elif isinstance(event, ErrorRecordEvent):
+            await self.stream_error._append(event.record)
+
+        elif isinstance(event, InformationRecordEvent):
+            await self.stream_information._append(event.record)
+
+        elif isinstance(event, ProgressRecordEvent):
+            await self.stream_progress._append(event.record)
+
+        elif isinstance(event, VerboseRecordEvent):
+            await self.stream_verbose._append(event.record)
+
+        elif isinstance(event, WarningRecordEvent):
+            await self.stream_warning._append(event.record)
 
         condition = self._event_conditions.get(event.message_type, None)
         if condition:
             async with condition:
                 condition.notify_all()
+
+    async def _invoke_host_call(
+        self,
+        host: PSHost,
+        event: t.Union[RunspacePoolHostCallEvent, PipelineHostCallEvent],
+        error_stream: AsyncPSDataCollection[ErrorRecord],
+    ) -> None:
+        ci = event.ci
+        mi = event.method_identifier
+        mp = event.method_parameters
+        method_metadata = get_host_method(host, mi, mp)
+        func = method_metadata.invoke
+
+        error_record = None
+        try:
+            if not func:
+                raise NotImplementedError()
+
+            if iscoroutinefunction(func):
+                return_value = await func()
+            else:
+                return_value = func()
+
+        except Exception as e:
+            setattr(e, "mi", mi)
+
+            # Any failure for non-void methods should be propagated back to the peer.
+            e_msg = str(e)
+            if not e_msg:
+                e_msg = f"{type(e).__qualname__} when running {mi}"
+
+            return_value = None
+            error_record = ErrorRecord(
+                Exception=NETException(e_msg),
+                FullyQualifiedErrorId="RemoteHostExecutionException",
+                CategoryInfo=ErrorCategoryInfo(
+                    Reason="Exception",
+                ),
+            )
+
+            if method_metadata.is_void:
+                # PowerShell continues on even if the exception was on the client host
+                await error_stream._append(error_record)
+                return
+
+        if not method_metadata.is_void:
+            self._pool.host_response(ci, return_value=return_value, error_record=error_record)
+            await self.connection.send_all(self._pool)
 
     async def _send_set_runspace_availability_ci(
         self,
@@ -425,7 +465,7 @@ class AsyncPipeline(t.Generic[T1]):
         self.stream_progress = AsyncPSDataCollection[ProgressRecord]()
         self.stream_verbose = AsyncPSDataCollection[VerboseRecord]()
         self.stream_warning = AsyncPSDataCollection[WarningRecord]()
-        self._stream_output: t.Optional[AsyncPSDataCollection[t.Any]] = None
+        self._stream_output = AsyncPSDataCollection[t.Any]()
 
         self._event_conditions: t.Dict[PSRPMessageType, asyncio.Condition] = {
             mt: asyncio.Condition()
@@ -448,25 +488,26 @@ class AsyncPipeline(t.Generic[T1]):
         Closes the pipeline resource on the peer. This is done automatically when the pipeline is completed or the
         Runspace Pool is closed but can be called manually if desired.
         """
-        # We call this from many places, we want a lock to ensure it's only run once.
-        async with self._close_lock:
-            pipeline = self.runspace_pool.pipeline_table.get(self.pipeline.pipeline_id)
-            if not pipeline or pipeline.pipeline.state == PSInvocationState.Disconnected:
-                return
+        pipeline = self.runspace_pool.pipeline_table.get(self.pipeline.pipeline_id)
+        if not pipeline or pipeline.pipeline.state == PSInvocationState.Disconnected:
+            return
 
-            await self.runspace_pool.connection.close(self.runspace_pool._pool, self.pipeline.pipeline_id)
-            del self.runspace_pool.pipeline_table[self.pipeline.pipeline_id]
+        await self.runspace_pool.connection.close(self.runspace_pool._pool, self.pipeline.pipeline_id)
+        del self.runspace_pool.pipeline_table[self.pipeline.pipeline_id]
 
-    async def connect(self) -> t.AsyncIterable[PSObject]:
+    async def connect(self) -> AsyncPSDataCollection[t.Any]:
         task = await self.connect_async()
-        return await task.wait()
+        return await task
 
     async def connect_async(
         self,
         output_stream: t.Optional[AsyncPSDataCollection[t.Any]] = None,
         completed: t.Optional[asyncio.Event] = None,
-    ) -> AsyncPipelineTask:
-        task = self._new_task(output_stream, completed)
+    ) -> asyncio.Task[AsyncPSDataCollection[t.Any]]:
+        if output_stream:
+            self._stream_output = output_stream
+
+        task = asyncio.create_task(self._pipelines_task(completed=completed))
 
         await self.runspace_pool.connection.connect(self.runspace_pool._pool, self.pipeline.pipeline_id)
         self.runspace_pool.pipeline_table[self.pipeline.pipeline_id] = self
@@ -481,7 +522,7 @@ class AsyncPipeline(t.Generic[T1]):
         input_data: t.Optional[t.Union[t.Iterable, t.AsyncIterable]] = None,
         output_stream: t.Optional[AsyncPSDataCollection[t.Any]] = None,
         buffer_input: bool = True,
-    ) -> t.Optional[t.AsyncIterable[t.Optional[PSObject]]]:
+    ) -> AsyncPSDataCollection[t.Any]:
         """Invoke the pipeline.
 
         Invokes the pipeline and yields the output as it is received. This takes the same arguments as
@@ -497,7 +538,7 @@ class AsyncPipeline(t.Generic[T1]):
             output_stream=output_stream,
             buffer_input=buffer_input,
         )
-        return await output_task.wait()
+        return await output_task
 
     async def invoke_async(
         self,
@@ -505,7 +546,7 @@ class AsyncPipeline(t.Generic[T1]):
         output_stream: t.Optional[AsyncPSDataCollection[t.Any]] = None,
         completed: t.Optional[asyncio.Event] = None,
         buffer_input: bool = True,
-    ) -> AsyncPipelineTask:
+    ) -> asyncio.Task[AsyncPSDataCollection[t.Any]]:
         """Begin the pipeline.
 
         Begin the pipeline execution and returns an async iterable that yields the output as they are received.
@@ -521,7 +562,10 @@ class AsyncPipeline(t.Generic[T1]):
             (t.AsyncIterable[PSObject]): An async iterable that can be iterated to receive the output objects as
                 they are received.
         """
-        task = self._new_task(output_stream, completed)
+        if output_stream:
+            self._stream_output = output_stream
+
+        task = asyncio.create_task(self._pipelines_task(completed=completed))
         pool = self.runspace_pool._pool
 
         try:
@@ -535,17 +579,19 @@ class AsyncPipeline(t.Generic[T1]):
         await self.runspace_pool.connection.send_all(pool)
 
         if input_data is not None:
-            if isinstance(input_data, t.Iterable):
 
-                async def async_input_gen() -> t.AsyncIterator:
+            async def input_gen(
+                input_data: t.Union[t.Iterable, t.AsyncIterable],
+            ) -> t.AsyncIterator:
+                if isinstance(input_data, t.Iterable):
                     for data in input_data:
                         yield data
 
-                input_gen = async_input_gen()
-            else:
-                input_gen = input_data
+                else:
+                    async for data in input_data:
+                        yield data
 
-            async for data in input_gen:
+            async for data in input_gen(input_data):
                 try:
                     self.pipeline.send(data)
 
@@ -569,13 +615,13 @@ class AsyncPipeline(t.Generic[T1]):
         Stops a running pipeline and waits for it to stop.
         """
         task = await self.stop_async()
-        await task.wait()
+        await task
 
     async def stop_async(
         self,
         completed: t.Optional[asyncio.Event] = None,
-    ) -> AsyncPipelineTask:
-        task = self._new_task(completed=completed, for_stop=True)
+    ) -> asyncio.Task:
+        task = asyncio.create_task(self._pipelines_task(completed=completed))
         await self.runspace_pool.connection.signal(self.runspace_pool._pool, self.pipeline.pipeline_id)
 
         return task
@@ -584,15 +630,17 @@ class AsyncPipeline(t.Generic[T1]):
         self,
         event: PSRPEvent,
     ) -> None:
+        host = getattr(self, "host", None) or self.runspace_pool.host
+
         if isinstance(event, PipelineStateEvent):
-            # TODO: Need to close the pipeline
+            # TODO: Need to close the streams
             await self.state_changed(event)
 
-        elif isinstance(event, PipelineHostCallEvent):
-            await self._on_host_call(event)
+        elif isinstance(event, PipelineHostCallEvent) and host:
+            await self.runspace_pool._invoke_host_call(host, event, self.stream_error)
 
         elif isinstance(event, PipelineOutputEvent):
-            raise NotImplementedError("Output stream")  # event.data
+            await self._stream_output._append(event.data)
 
         elif isinstance(event, DebugRecordEvent):
             await self.stream_debug._append(event.record)
@@ -617,68 +665,18 @@ class AsyncPipeline(t.Generic[T1]):
             async with condition:
                 condition.notify_all()
 
-    def _new_task(
+    async def _pipelines_task(
         self,
-        output_stream: t.Optional[AsyncPSDataCollection[t.Any]] = None,
         completed: t.Optional[asyncio.Event] = None,
-        for_stop: bool = False,
-    ) -> AsyncPipelineTask:
-        task_output = None
-        if not output_stream:
-            output_stream = task_output = AsyncPSDataCollection[t.Any]()
-        self._output_stream = output_stream
+    ) -> AsyncPSDataCollection[t.Any]:
+        condition = self._event_conditions[PSRPMessageType.PipelineState]
+        async with condition:
+            condition.wait_for(lambda: self.state != PSInvocationState.Running)
 
-        completed = completed or asyncio.Event()
-        if for_stop:
-            self._completed_stop = completed
+        if completed:
+            completed.set()
 
-        else:
-            self._completed = completed
-            # TODO: Reset streams so we can append and iterate even more data
-
-        return AsyncPipelineTask(completed, task_output)
-
-    async def _on_host_call(
-        self,
-        event: PipelineHostCallEvent,
-    ) -> None:
-        host = getattr(self, "host", None) or self.runspace_pool.host
-
-        ci = event.ci
-        mi = event.method_identifier
-        mp = event.method_parameters
-        method_metadata = get_host_method(host, mi, mp)
-        func = method_metadata.invoke
-
-        error_record = None
-        try:
-            return_value = await _invoke_async(func or _not_implemented)
-
-        except Exception as e:
-            setattr(e, "mi", mi)
-
-            # Any failure for non-void methods should be propagated back to the peer.
-            e_msg = str(e)
-            if not e_msg:
-                e_msg = f"{type(e).__qualname__} when running {mi}"
-
-            return_value = None
-            error_record = ErrorRecord(
-                Exception=NETException(e_msg),
-                FullyQualifiedErrorId="RemoteHostExecutionException",
-                CategoryInfo=ErrorCategoryInfo(
-                    Reason="Exception",
-                ),
-            )
-
-            if method_metadata.is_void:
-                # PowerShell continues on even if the exception was on the client host
-                await self.stream_error._append(error_record)
-                return
-
-        if not method_metadata.is_void:
-            self.runspace_pool._pool.host_response(ci, return_value=return_value, error_record=error_record)
-            await self.runspace_pool.connection.send_all(self.runspace_pool._pool)
+        return self._stream_output
 
 
 class AsyncCommandMetaPipeline(AsyncPipeline[ClientGetCommandMetadata]):
@@ -751,7 +749,7 @@ class AsyncPowerShell(AsyncPipeline[ClientPowerShell]):
         output_stream: t.Optional[AsyncPSDataCollection[t.Any]] = None,
         completed: t.Optional[asyncio.Event] = None,
         buffer_input: bool = True,
-    ) -> AsyncPipelineTask:
+    ) -> asyncio.Task[AsyncPSDataCollection[t.Any]]:
         self.pipeline.metadata.no_input = input_data is None
 
         return await super().invoke_async(input_data, output_stream, completed, buffer_input)

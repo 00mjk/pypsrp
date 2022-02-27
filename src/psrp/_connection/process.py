@@ -36,7 +36,7 @@ class ProcessInfo(OutOfProcInfo):
 
         self.executable = executable
         self.arguments = arguments or []
-        if executable == "pwsh" and arguments is None:
+        if arguments is None:
             self.arguments = ["-NoProfile", "-NoLogo", "-s"]
 
         self._process: t.Optional[subprocess.Popen] = None
@@ -95,7 +95,7 @@ class AsyncProcessInfo(AsyncOutOfProcInfo):
 
         self.executable = executable
         self.arguments = arguments or []
-        if executable == "pwsh" and arguments is None:
+        if arguments is None:
             self.arguments = ["-NoProfile", "-NoLogo", "-s"]
 
         self._process: t.Optional[asyncio.subprocess.Process] = None
