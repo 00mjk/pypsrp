@@ -340,6 +340,7 @@ class AsyncOutOfProcInfo(AsyncConnectionInfo):
         pool: ClientRunspacePool,
     ) -> None:
         buffer = bytearray()
+        out_of_band_reqs: t.List[asyncio.Task] = []
 
         try:
             while True:
@@ -374,12 +375,19 @@ class AsyncOutOfProcInfo(AsyncConnectionInfo):
                     payload_data = PSRPPayload(data, StreamType.default, ps_guid)
 
                 if packet.tag == "Data":
-                    await self.process_response(pool, payload_data)
+                    data_available = await self.process_response(pool, payload_data)
+                    if data_available:
+                        out_of_band_reqs.append(asyncio.create_task(self.send_all(pool)))
 
                 else:
                     async with self.__wait_condition:
                         self.__wait_table.remove((packet.tag, ps_guid))
                         self.__wait_condition.notify_all()
+
+                for task in list(out_of_band_reqs):
+                    if task.done():
+                        await task
+                        out_of_band_reqs.remove(task)
 
         finally:
             await self.process_response(pool, None)

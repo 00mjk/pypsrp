@@ -880,6 +880,7 @@ Add-Content -LiteralPath '{0}' -Value $Data
                 $applicationArguments = $null
                 $connInfo = [Management.Automation.Runspaces.NamedPipeConnectionInfo]::new($args[0])
                 $rs = [RunspaceFactory]::CreateRunspace($connInfo, $args[1], $null, $applicationArguments)
+                # $rs = [RunspaceFactory]::CreateRunspacePool(1, 1, $connInfo, $args[1], $null, $applicationArguments)
                 $rs.Open()
                 $rs
             }).AddArgument($pipeName).AddArgument($customHost)

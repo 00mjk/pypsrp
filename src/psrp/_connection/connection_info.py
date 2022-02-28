@@ -2,11 +2,8 @@
 # Copyright: (c) 2022, Jordan Borean (@jborean93) <jborean93@gmail.com>
 # MIT License (see LICENSE or https://opensource.org/licenses/MIT)
 
-import asyncio
 import enum
 import logging
-import queue
-import threading
 import typing as t
 import uuid
 
@@ -111,12 +108,12 @@ class ConnectionInfo(_ConnectionInfoBase):
     ) -> None:
         super().__init__()
 
-        self.__event_callback: t.Dict[uuid.UUID, t.Callable[[PSRPEvent], None]] = {}
+        self.__event_callback: t.Dict[uuid.UUID, t.Callable[[PSRPEvent], bool]] = {}
 
     def register_pool_callback(
         self,
         runspace_pool_id: uuid.UUID,
-        callback: t.Callable[[PSRPEvent], None],
+        callback: t.Callable[[PSRPEvent], bool],
     ) -> None:
         """Register callback function for pool.
 
@@ -134,7 +131,7 @@ class ConnectionInfo(_ConnectionInfoBase):
         self,
         pool: ClientRunspacePool,
         data: t.Optional[PSRPPayload] = None,
-    ) -> None:
+    ) -> bool:
         """Process an incoming PSRP payload.
 
         Processes any incoming PSRP payload received from the peer and invokes
@@ -144,6 +141,9 @@ class ConnectionInfo(_ConnectionInfoBase):
             pool: The Runspace Pool the payload is for.
             data: The PSRPPayload to process. Will be None to signify no more
                 data is expected for this pool.
+
+        Returns:
+            bool: More data has been added to be sent to the peer.
         """
         callback = self.__event_callback[pool.runspace_pool_id]
 
@@ -154,12 +154,17 @@ class ConnectionInfo(_ConnectionInfoBase):
         else:
             del self.__event_callback[pool.runspace_pool_id]
 
+        data_queued = False
         while True:
             event = pool.next_event()
             if not event:
                 break
 
-            callback(event)
+            res = callback(event)
+            if res:
+                data_queued = True
+
+        return data_queued
 
     ################
     # PSRP Methods #
@@ -343,12 +348,12 @@ class AsyncConnectionInfo(_ConnectionInfoBase):
     ) -> None:
         super().__init__()
 
-        self.__event_callback: t.Dict[uuid.UUID, t.Callable[[PSRPEvent], t.Coroutine]] = {}
+        self.__event_callback: t.Dict[uuid.UUID, t.Callable[[PSRPEvent], t.Awaitable[bool]]] = {}
 
     def register_pool_callback(
         self,
         runspace_pool_id: uuid.UUID,
-        callback: t.Callable[[PSRPEvent], t.Coroutine],
+        callback: t.Callable[[PSRPEvent], t.Awaitable[bool]],
     ) -> None:
         """Register callback coroutine for pool.
 
@@ -366,7 +371,7 @@ class AsyncConnectionInfo(_ConnectionInfoBase):
         self,
         pool: ClientRunspacePool,
         data: t.Optional[PSRPPayload] = None,
-    ) -> None:
+    ) -> bool:
         """Process an incoming PSRP payload.
 
         Processes any incoming PSRP payload received from the peer and invokes
@@ -376,6 +381,9 @@ class AsyncConnectionInfo(_ConnectionInfoBase):
             pool: The Runspace Pool the payload is for.
             data: The PSRPPayload to process. Will be None to signify no more
                 data is expected for this pool.
+
+        Returns:
+            bool: More data has been added to be sent to the peer.
         """
         callback = self.__event_callback[pool.runspace_pool_id]
 
@@ -386,12 +394,17 @@ class AsyncConnectionInfo(_ConnectionInfoBase):
         else:
             del self.__event_callback[pool.runspace_pool_id]
 
+        data_queued = False
         while True:
             event = pool.next_event()
             if not event:
                 break
 
-            await callback(event)
+            res = await callback(event)
+            if res:
+                data_queued = True
+
+        return data_queued
 
     ################
     # PSRP Methods #
