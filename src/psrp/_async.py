@@ -67,7 +67,14 @@ class AsyncPSDataCollection(t.Generic[T], t.List[T]):
     for each new entry until the collection is complete. The values for a
     collection depend on the stream that this represents.
 
+    The events are only fired when an element is added by the remote PowerShell
+    pipeline. Any normal list additions are treated as normal.
     FIXME: Add doc link to event subscribers.
+
+    Collections are never marked as completed by the PowerShell pipeline so
+    this event cannot be relied upon for detecting if a pipeline is finished.
+    The `on_completed` event is only fired if the `complete()` function is
+    called.
 
     Args:
         blocking_iterator: A keyword argument that when True will cause the
@@ -81,9 +88,10 @@ class AsyncPSDataCollection(t.Generic[T], t.List[T]):
 
     Events:
         on_completed: Called when the collection has been marked as completed.
-        data_added: Called when the value has been added to the collection.
+        data_added: Called when the value has been added to the collection from
+            the PowerShell pipeline.
         data_adding: Called when the value is about to be added to the
-            collection.
+            collection from the PowerShell pipeline.
     """
 
     def __init__(
@@ -102,14 +110,6 @@ class AsyncPSDataCollection(t.Generic[T], t.List[T]):
 
         self._add_condition = asyncio.Condition()
 
-    def __add__(
-        self,
-        value: t.List[T],
-    ) -> t.List[T]:
-        if self.completed:
-            raise ValueError("FIXME: Better error when adding on completed stream")
-        return super().__add__(value)
-
     def __aiter__(
         self,
     ) -> t.AsyncIterator[T]:
@@ -120,13 +120,15 @@ class AsyncPSDataCollection(t.Generic[T], t.List[T]):
         value: T,
     ) -> None:
         if self.completed:
-            raise ValueError("FIXME: Better error when appending on completed stream")
+            raise ValueError("Objects cannot be added to a closed buffer")
         return super().append(value)
 
     async def complete(self) -> None:
         """Mark the collection as complete and no more entries will be added."""
-        self._completed = True
+        self.completed = True
         await self.on_completed(True)
+        async with self._add_condition:
+            self._add_condition.notify_all()
 
     def insert(
         self,
@@ -134,7 +136,7 @@ class AsyncPSDataCollection(t.Generic[T], t.List[T]):
         value: T,
     ) -> None:
         if self.completed:
-            raise ValueError("FIXME: Better error when inserting on completed stream")
+            raise ValueError("Objects cannot be added to a closed buffer")
         return super().insert(index, value)
 
     async def _append(
@@ -142,6 +144,11 @@ class AsyncPSDataCollection(t.Generic[T], t.List[T]):
         value: T,
     ) -> None:
         """Used internally to add a new value to the collection and fire the events."""
+        # If the collection is marked as complete PowerShell just silently drops
+        # the record and doesn't fire any event.
+        if self.completed:
+            return
+
         await self.data_adding(value)
 
         async with self._add_condition:
@@ -190,6 +197,13 @@ class MessageResult(t.Generic[EventType]):
         self._result: t.Optional[EventType] = None
 
     async def wait(self) -> EventType:
+        """Waits for message to be set.
+
+        Waits for the message to be set and returns the result.
+
+        Returns:
+            EventType: The set event type.
+        """
         await self._event.wait()
 
         # An event is only set when _result is added
@@ -199,6 +213,18 @@ class MessageResult(t.Generic[EventType]):
         self,
         value: EventType,
     ) -> bool:
+        """Attempts to set the message result.
+
+        Attempts to set the result of the message based on the message type
+        and optional condition applied to the object.
+
+        Args:
+            value: The event to set.
+
+        Returns:
+            bool: Whether the event matched the message result condition and
+            was set.
+        """
         if isinstance(value, self._event_type) and (not self._condition or self._condition(value)):
             self._result = value
             self._event.set()
@@ -728,7 +754,7 @@ class AsyncPipeline(t.Generic[PipelineType]):
         output_stream: t.Optional[AsyncPSDataCollection[t.Any]] = None,
         completed: t.Optional[asyncio.Event] = None,
     ) -> asyncio.Task[t.List[t.Any]]:
-        if output_stream:
+        if output_stream is not None:
             self._explicit_output = True
             self._stream_output = output_stream
         else:
@@ -791,7 +817,7 @@ class AsyncPipeline(t.Generic[PipelineType]):
             (t.AsyncIterable[PSObject]): An async iterable that can be iterated to receive the output objects as
                 they are received.
         """
-        if output_stream:
+        if output_stream is not None:
             self._explicit_output = True
             self._stream_output = output_stream
         else:

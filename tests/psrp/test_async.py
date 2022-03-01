@@ -8,6 +8,22 @@ import pytest_mock
 import psrp
 
 
+class PSEventCallbacks:
+    def __init__(self) -> None:
+        self.events: t.List[psrpcore.PSRPEvent] = []
+
+    async def __call__(self, event: psrpcore.PSRPEvent) -> None:
+        self.events.append(event)
+
+
+class PSDataCallbacks:
+    def __init__(self) -> None:
+        self.data: t.List[t.Any] = []
+
+    async def __call__(self, data: t.Any) -> None:
+        self.data.append(data)
+
+
 async def test_open_runspace(psrp_async_proc: psrp.AsyncProcessInfo) -> None:
     async with psrp.AsyncRunspacePool(psrp_async_proc) as rp:
         assert rp.state == psrpcore.types.RunspacePoolState.Opened
@@ -93,8 +109,8 @@ async def test_runspace_reset_state(psrp_async_proc: psrp.AsyncProcessInfo) -> N
         actual = await ps.invoke()
         assert actual == ["foo"]
 
-        actual = await rp.reset_runspace_state()
-        assert actual
+        actual_res = await rp.reset_runspace_state()
+        assert actual_res
 
         actual = await ps.invoke()
         assert actual == [None]
@@ -154,14 +170,7 @@ async def test_runspace_host_call_failure(
 
 
 async def test_runspace_user_event(psrp_async_proc: psrp.AsyncProcessInfo) -> None:
-    class PSCallbacks:
-        def __init__(self) -> None:
-            self.events: t.List[psrpcore.PSRPEvent] = []
-
-        async def __call__(self, event: psrpcore.PSRPEvent) -> None:
-            self.events.append(event)
-
-    callback = PSCallbacks()
+    callback = PSEventCallbacks()
     async with psrp.AsyncRunspacePool(psrp_async_proc) as rp:
         rp.user_event += callback
 
@@ -215,7 +224,7 @@ async def test_run_powershell(psrp_async_proc: psrp.AsyncProcessInfo) -> None:
         assert actual == ["hi"]
 
 
-async def test_run_powershell_secure_string(psrp_async_proc: psrp.AsyncProcessInfo) -> None:
+async def test_powershell_secure_string(psrp_async_proc: psrp.AsyncProcessInfo) -> None:
     async with psrp.AsyncRunspacePool(psrp_async_proc) as rp:
         ps = psrp.AsyncPowerShell(rp)
 
@@ -227,7 +236,7 @@ async def test_run_powershell_secure_string(psrp_async_proc: psrp.AsyncProcessIn
         assert actual[0].decrypt() == "my secret"
 
 
-async def test_run_powershell_receive_secure_string(psrp_async_proc: psrp.AsyncProcessInfo) -> None:
+async def test_powershell_receive_secure_string(psrp_async_proc: psrp.AsyncProcessInfo) -> None:
     async with psrp.AsyncRunspacePool(psrp_async_proc) as rp:
         ps = psrp.AsyncPowerShell(rp)
 
@@ -245,24 +254,24 @@ async def test_run_powershell_receive_secure_string(psrp_async_proc: psrp.AsyncP
         assert actual[0].decrypt() == "secret"
 
 
-async def test_run_powershell_streams(psrp_async_proc: psrp.AsyncProcessInfo) -> None:
+async def test_powershell_streams(psrp_async_proc: psrp.AsyncProcessInfo) -> None:
     async with psrp.AsyncRunspacePool(psrp_async_proc) as rp:
         ps = psrp.AsyncPowerShell(rp)
 
         ps.add_script(
             """
-$DebugPreference = 'Continue'
-$VerbosePreference = 'Continue'
-$WarningPreference = 'Continue'
+            $DebugPreference = 'Continue'
+            $VerbosePreference = 'Continue'
+            $WarningPreference = 'Continue'
 
-Write-Debug -Message debug
-Write-Error -Message error
-Write-Information -MessageData information
-Write-Output -InputObject output
-Write-Progress -Activity progress -Status done -PercentComplete 100
-Write-Verbose -Message verbose
-Write-Warning -Message warning
-"""
+            Write-Debug -Message debug
+            Write-Error -Message error
+            Write-Information -MessageData information
+            Write-Output -InputObject output
+            Write-Progress -Activity progress -Status done -PercentComplete 100
+            Write-Verbose -Message verbose
+            Write-Warning -Message warning
+            """
         )
 
         actual = await ps.invoke()
@@ -289,3 +298,220 @@ Write-Warning -Message warning
 
         assert len(ps.stream_warning) == 1
         assert ps.stream_warning[0].Message == "warning"
+
+
+async def test_powershell_state_changed(psrp_async_proc: psrp.AsyncProcessInfo) -> None:
+    callbacks = PSEventCallbacks()
+
+    async with psrp.AsyncRunspacePool(psrp_async_proc) as rp:
+        ps = psrp.AsyncPowerShell(rp)
+        ps.state_changed += callbacks
+
+        ps.add_script('echo "hi"')
+        await ps.invoke()
+        assert len(callbacks.events) == 1
+        assert isinstance(callbacks.events[0], psrpcore.PipelineStateEvent)
+        assert callbacks.events[0].state == ps.state
+
+        ps.state_changed -= callbacks
+
+        await ps.invoke()
+        assert len(callbacks.events)
+
+
+async def test_powershell_stream_events(psrp_async_proc: psrp.AsyncProcessInfo) -> None:
+    callbacks = PSDataCallbacks()
+    async with psrp.AsyncRunspacePool(psrp_async_proc) as rp:
+        ps = psrp.AsyncPowerShell(rp)
+        ps.add_script('$VerbosePreference = "Continue"; Write-Verbose -Message verbose')
+
+        ps.stream_verbose.data_adding += callbacks
+        ps.stream_verbose.data_added += callbacks
+        ps.stream_verbose.on_completed += callbacks
+        ps.state_changed += callbacks
+
+        await ps.invoke()
+
+        assert len(callbacks.data) == 3
+        assert isinstance(callbacks.data[0], psrpcore.types.VerboseRecord)
+        assert callbacks.data[0].Message == "verbose"
+        assert isinstance(callbacks.data[1], psrpcore.types.VerboseRecord)
+        assert callbacks.data[1].Message == "verbose"
+        assert isinstance(callbacks.data[2], psrpcore.PipelineStateEvent)
+        assert len(ps.stream_verbose) == 1
+
+        await ps.stream_verbose.complete()
+        assert len(callbacks.data) == 4
+        assert isinstance(callbacks.data[3], bool)
+        assert callbacks.data[3] is True
+
+        with pytest.raises(ValueError, match="Objects cannot be added to a closed buffer"):
+            ps.stream_verbose.append(ps.stream_verbose[0])
+
+        with pytest.raises(ValueError, match="Objects cannot be added to a closed buffer"):
+            ps.stream_verbose.insert(0, ps.stream_verbose[0])
+
+        await ps.invoke()
+        assert len(callbacks.data) == 5
+        assert isinstance(callbacks.data[4], psrpcore.PipelineStateEvent)
+        assert len(ps.stream_verbose) == 1
+
+
+async def test_powershell_blocking_iterator(psrp_async_proc: psrp.AsyncProcessInfo) -> None:
+    """
+    $ps = [PowerShell]::Create()
+    $in = [System.Management.Automation.PSDataCollection[PSObject]]::new()
+    $out = [System.Management.Automation.PSDataCollection[PSObject]]::new()
+    $out.BlockingEnumerator = $true
+
+    Register-ObjectEvent -InputObject $out -EventName Completed -Action { Write-Host "completed" }
+    Register-ObjectEvent -InputObject $out -EventName DataAdding -Action { Write-Host "data adding: $args" }
+    Register-ObjectEvent -InputObject $out -EventName DataAdded -Action { Write-Host "data added: $args" }
+
+    $ps2 = [PowerShell]::Create()
+    $ps2.AddScript('Start-Sleep -Seconds 10; $args[0].Complete()').AddArgument($out)
+    $t2 = $ps2.BeginInvoke()
+
+    $ps.AddScript('"1"; Start-Sleep -Seconds 2; "2"; Start-Sleep -Seconds 2; "3"; Start-Sleep -Seconds 2; "4"')
+    $t1 = $ps.BeginInvoke($in, $out)
+
+    $out
+
+    $ps2.EndInvoke($t2)
+    $ps.EndInvoke($t2)
+    """
+    async with psrp.AsyncRunspacePool(psrp_async_proc) as rp:
+        ps = psrp.AsyncPowerShell(rp)
+
+        out = psrp.AsyncPSDataCollection[t.Any](blocking_iterator=True)
+
+        async def state_callback(event: psrpcore.PipelineStateEvent) -> None:
+            await out.complete()
+
+        ps.state_changed += state_callback
+
+        ps.add_script("1, 2, 3, 4, 5")
+        task = await ps.invoke_async(output_stream=out)
+
+        result = []
+        async for data in out:
+            result.append(data)
+
+        assert ps.state == psrpcore.types.PSInvocationState.Completed
+        assert result == [1, 2, 3, 4, 5]
+
+        task_out = await task
+        assert task_out == []
+
+
+async def test_powershell_host_call(
+    psrp_async_proc: psrp.AsyncProcessInfo,
+    mocker: pytest_mock.MockerFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rp_host = psrp.PSHost(ui=psrp.PSHostUI())
+    rp_write_line = mocker.MagicMock()
+    monkeypatch.setattr(rp_host.ui, "read_line", lambda: "runspace line")
+    monkeypatch.setattr(rp_host.ui, "write_line2", rp_write_line)
+
+    ps_host = psrp.PSHost(ui=psrp.PSHostUI())
+    ps_write_line = mocker.MagicMock()
+    monkeypatch.setattr(ps_host.ui, "read_line", lambda: "pipeline line")
+    monkeypatch.setattr(ps_host.ui, "write_line2", ps_write_line)
+
+    async with psrp.AsyncRunspacePool(psrp_async_proc, host=rp_host) as rp:
+        ps = psrp.AsyncPowerShell(rp, host=ps_host)
+        ps.add_script(
+            """
+            $Host.UI.ReadLine()
+            $Host.UI.WriteLine("host output")
+            """
+        )
+        actual = await ps.invoke()
+        assert actual == ["pipeline line"]
+        rp_write_line.assert_not_called()
+        ps_write_line.assert_called_once_with("host output")
+
+
+async def test_powershell_host_call_failure(
+    psrp_async_proc: psrp.AsyncProcessInfo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ps_host = psrp.PSHost(ui=psrp.PSHostUI())
+
+    async with psrp.AsyncRunspacePool(psrp_async_proc) as rp:
+        ps = psrp.AsyncPowerShell(rp, host=ps_host)
+        ps.add_script(
+            """
+            $Host.UI.WriteLine("host output")
+            """
+        )
+        actual = await ps.invoke()
+        assert actual == []
+        assert len(rp.stream_error) == 0
+        assert len(ps.stream_error) == 1
+        assert isinstance(ps.stream_error[0], psrpcore.types.ErrorRecord)
+        assert str(ps.stream_error[0]) == "NotImplementedError when running HostMethodIdentifier.WriteLine2"
+
+
+async def test_powershell_complex_commands(psrp_async_proc: psrp.AsyncProcessInfo) -> None:
+    async with psrp.AsyncRunspacePool(psrp_async_proc) as rp:
+        ps = psrp.AsyncPowerShell(rp)
+        ps.add_command("Set-Variable").add_parameters(Name="string", Value="foo")
+        ps.add_statement()
+
+        ps.add_command("Get-Variable").add_parameter("Name", "string")
+        ps.add_command("Select-Object").add_parameter("Property", ["Name", "Value"])
+        ps.add_statement()
+
+        ps.add_command("Get-Variable").add_argument("string").add_parameter("ValueOnly", True)
+        ps.add_command("Select-Object")
+        ps.add_statement()
+
+        actual = await ps.invoke()
+        assert len(actual) == 2
+        assert isinstance(actual[0], psrpcore.types.PSObject)
+        assert actual[0].Name == "string"
+        assert actual[0].Value == "foo"
+        assert actual[1] == "foo"
+
+
+async def test_powershell_input_as_iterable(psrp_async_proc: psrp.AsyncProcessInfo) -> None:
+    a = ""
+
+
+async def test_powershell_input_as_async_iterable(psrp_async_proc: psrp.AsyncProcessInfo) -> None:
+    a = ""
+
+
+async def test_powershell_unbuffered_input(psrp_async_proc: psrp.AsyncProcessInfo) -> None:
+    a = ""
+
+
+async def test_powershell_custom_output(psrp_async_proc: psrp.AsyncProcessInfo) -> None:
+    a = ""
+
+
+async def test_powershell_invoke_async(psrp_async_proc: psrp.AsyncProcessInfo) -> None:
+    a = ""
+
+
+async def test_powershell_stop(psrp_async_proc: psrp.AsyncProcessInfo) -> None:
+    a = ""
+
+
+async def test_powershell_stop_async(psrp_async_proc: psrp.AsyncProcessInfo) -> None:
+    a = ""
+
+
+@pytest.mark.skip
+async def test_powershell_connect(psrp_async_proc: psrp.AsyncProcessInfo) -> None:
+    raise NotImplementedError()
+
+
+@pytest.mark.skip
+async def test_powershell_connect_async(psrp_async_proc: psrp.AsyncProcessInfo) -> None:
+    raise NotImplementedError()
+
+
+async def test_run_get_command_meta(psrp_async_proc: psrp.AsyncProcessInfo) -> None:
+    a = ""

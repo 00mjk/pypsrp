@@ -113,6 +113,8 @@ class AsyncProcessInfo(AsyncOutOfProcInfo):
         if not self._process:
             raise Exception("FIXME: Process not started")
 
+        print(data.decode())
+
         writer: asyncio.StreamWriter = self._process.stdin  # type: ignore[assignment] # Will be set
         writer.write(data)
         await writer.drain()
