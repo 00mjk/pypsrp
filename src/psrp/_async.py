@@ -51,6 +51,7 @@ from psrpcore.types import (
 
 from ._compat import iscoroutinefunction
 from ._connection.connection_info import AsyncConnectionInfo
+from ._exceptions import PipelineFailed
 from ._host import PSHost, get_host_method
 
 PipelineType = t.TypeVar("PipelineType", bound=t.Union[ClientGetCommandMetadata, ClientPowerShell])
@@ -734,8 +735,9 @@ class AsyncPipeline(t.Generic[PipelineType]):
     async def close(self) -> None:
         """Closes the pipeline.
 
-        Closes the pipeline resource on the peer. This is done automatically when the pipeline is completed or the
-        Runspace Pool is closed but can be called manually if desired.
+        Closes the pipeline resource on the peer. This is done automatically
+        when the pipeline is completed or the Runspace Pool is closed but can
+        be called manually if desired.
         """
         async with self._close_lock:
             pipeline = self.runspace_pool.pipeline_table.get(self._pipeline.pipeline_id)
@@ -946,9 +948,8 @@ class AsyncPipeline(t.Generic[PipelineType]):
 
         await self.close()
 
-        if not for_stop and state.state == PSInvocationState.Failed:
-            # FIXME: wrap in Python exception
-            raise Exception(state.reason)
+        if not for_stop and state.state in [PSInvocationState.Failed, PSInvocationState.Stopped]:
+            raise PipelineFailed(t.cast(ErrorRecord, state.reason))
 
         return [] if self._explicit_output else list(self._stream_output)
 

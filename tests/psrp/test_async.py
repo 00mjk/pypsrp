@@ -1,3 +1,4 @@
+import asyncio
 import datetime
 import typing as t
 
@@ -30,6 +31,7 @@ async def test_open_runspace(psrp_async_proc: psrp.AsyncProcessInfo) -> None:
         assert rp.max_runspaces == 1
         assert rp.min_runspaces == 1
         assert rp.pipeline_table == {}
+        assert isinstance(rp.application_private_data, dict)
 
     assert rp.state == psrpcore.types.RunspacePoolState.Closed
 
@@ -300,6 +302,18 @@ async def test_powershell_streams(psrp_async_proc: psrp.AsyncProcessInfo) -> Non
         assert ps.stream_warning[0].Message == "warning"
 
 
+async def test_powershell_invalid_command(psrp_async_proc: psrp.AsyncProcessInfo) -> None:
+    async with psrp.AsyncRunspacePool(psrp_async_proc) as rp:
+        ps = psrp.AsyncPowerShell(rp)
+        ps.add_command("Fake-Command")
+
+        with pytest.raises(psrp.PipelineFailed, match="The term 'Fake-Command' is not recognized"):
+            await ps.invoke()
+
+        # On an exception for Invoke() pwsh does not set this so it's also not set here.
+        assert not ps.had_errors
+
+
 async def test_powershell_state_changed(psrp_async_proc: psrp.AsyncProcessInfo) -> None:
     callbacks = PSEventCallbacks()
 
@@ -465,7 +479,6 @@ async def test_powershell_complex_commands(psrp_async_proc: psrp.AsyncProcessInf
 
         ps.add_command("Get-Variable").add_argument("string").add_parameter("ValueOnly", True)
         ps.add_command("Select-Object")
-        ps.add_statement()
 
         actual = await ps.invoke()
         assert len(actual) == 2
@@ -476,31 +489,168 @@ async def test_powershell_complex_commands(psrp_async_proc: psrp.AsyncProcessInf
 
 
 async def test_powershell_input_as_iterable(psrp_async_proc: psrp.AsyncProcessInfo) -> None:
-    a = ""
+    async with psrp.AsyncRunspacePool(psrp_async_proc) as rp:
+        ps = psrp.AsyncPowerShell(rp)
+        ps.add_script("begin { $i = 0 }; process { [PSCustomObject]@{Idx = $i; Value = $_}; $i++ }")
+
+        actual = await ps.invoke([1, "2", 3])
+        assert len(actual) == 3
+
+        assert actual[0].Idx == 0
+        assert actual[0].Value == 1
+        assert actual[1].Idx == 1
+        assert actual[1].Value == "2"
+        assert actual[2].Idx == 2
+        assert actual[2].Value == 3
 
 
 async def test_powershell_input_as_async_iterable(psrp_async_proc: psrp.AsyncProcessInfo) -> None:
-    a = ""
+    async def my_iterable() -> t.AsyncIterator[int]:
+        yield 1
+        await asyncio.sleep(0)
+        yield 2
+        yield 3
+
+    async with psrp.AsyncRunspacePool(psrp_async_proc) as rp:
+        ps = psrp.AsyncPowerShell(rp)
+        ps.add_script("begin { $i = 0 }; process { [PSCustomObject]@{Idx = $i; Value = $_}; $i++ }")
+
+        actual = await ps.invoke(my_iterable())
+        assert len(actual) == 3
+
+        assert actual[0].Idx == 0
+        assert actual[0].Value == 1
+        assert actual[1].Idx == 1
+        assert actual[1].Value == 2
+        assert actual[2].Idx == 2
+        assert actual[2].Value == 3
 
 
 async def test_powershell_unbuffered_input(psrp_async_proc: psrp.AsyncProcessInfo) -> None:
-    a = ""
+    async with psrp.AsyncRunspacePool(psrp_async_proc) as rp:
+        ps = psrp.AsyncPowerShell(rp)
+        ps.add_script("begin { $i = 0 }; process { [PSCustomObject]@{Idx = $i; Value = $_}; $i++ }")
 
+        actual = await ps.invoke([1, "2", 3], buffer_input=False)
+        assert len(actual) == 3
 
-async def test_powershell_custom_output(psrp_async_proc: psrp.AsyncProcessInfo) -> None:
-    a = ""
+        assert actual[0].Idx == 0
+        assert actual[0].Value == 1
+        assert actual[1].Idx == 1
+        assert actual[1].Value == "2"
+        assert actual[2].Idx == 2
+        assert actual[2].Value == 3
 
 
 async def test_powershell_invoke_async(psrp_async_proc: psrp.AsyncProcessInfo) -> None:
-    a = ""
+    async with psrp.AsyncRunspacePool(psrp_async_proc) as rp:
+        ps = psrp.AsyncPowerShell(rp)
+        ps.add_script("1; Start-Sleep -Seconds 1; 2")
+
+        task = await ps.invoke_async()
+        assert ps.state == psrpcore.types.PSInvocationState.Running
+        actual = await task
+        assert ps.state == psrpcore.types.PSInvocationState.Completed
+        assert actual == [1, 2]
+
+
+async def test_powershell_invoke_async_on_complete(psrp_async_proc: psrp.AsyncProcessInfo) -> None:
+    async with psrp.AsyncRunspacePool(psrp_async_proc) as rp:
+        ps = psrp.AsyncPowerShell(rp)
+        ps.add_script("1; Start-Sleep -Seconds 1; 2")
+
+        on_complete = asyncio.Event()
+        task = await ps.invoke_async(completed=on_complete)
+        await on_complete.wait()
+        actual = await task
+
+        assert actual == [1, 2]
 
 
 async def test_powershell_stop(psrp_async_proc: psrp.AsyncProcessInfo) -> None:
-    a = ""
+    async with psrp.AsyncRunspacePool(psrp_async_proc) as rp:
+        ps = psrp.AsyncPowerShell(rp)
+        ps.add_script("1; Start-Sleep -Seconds 60; 2")
+
+        task = await ps.invoke_async()
+        assert ps.state == psrpcore.types.PSInvocationState.Running
+
+        await ps.stop()
+
+        with pytest.raises(psrp.PipelineFailed, match="The pipeline has been stopped."):
+            await task
+
+        # Try again with explicit output to capture before the stop
+        out = psrp.AsyncPSDataCollection[t.Any]()
+        out_received = asyncio.Event()
+
+        async def wait_out(event: psrpcore.PSRPEvent) -> None:
+            out_received.set()
+
+        out.data_added += wait_out
+
+        task = await ps.invoke_async(output_stream=out)
+        await out_received.wait()
+        await ps.stop()
+
+        with pytest.raises(psrp.PipelineFailed, match="The pipeline has been stopped."):
+            await task
+
+        assert out == [1]
 
 
 async def test_powershell_stop_async(psrp_async_proc: psrp.AsyncProcessInfo) -> None:
-    a = ""
+    async with psrp.AsyncRunspacePool(psrp_async_proc) as rp:
+        ps = psrp.AsyncPowerShell(rp)
+
+        out = psrp.AsyncPSDataCollection[t.Any]()
+        out_received = asyncio.Event()
+
+        async def wait_out(event: psrpcore.PSRPEvent) -> None:
+            out_received.set()
+
+        out.data_added += wait_out
+
+        ps.add_script("1; Start-Sleep -Seconds 60; 2")
+
+        invoke_task = await ps.invoke_async(output_stream=out)
+        await out_received.wait()
+
+        stop_task = await ps.stop_async()
+        await stop_task
+
+        with pytest.raises(psrp.PipelineFailed, match="The pipeline has been stopped."):
+            await invoke_task
+
+        assert out == [1]
+
+
+async def test_powershell_stop_async_on_completed(psrp_async_proc: psrp.AsyncProcessInfo) -> None:
+    async with psrp.AsyncRunspacePool(psrp_async_proc) as rp:
+        ps = psrp.AsyncPowerShell(rp)
+
+        out = psrp.AsyncPSDataCollection[t.Any]()
+        out_received = asyncio.Event()
+
+        async def wait_out(event: psrpcore.PSRPEvent) -> None:
+            out_received.set()
+
+        out.data_added += wait_out
+
+        ps.add_script("1; Start-Sleep -Seconds 60; 2")
+
+        invoke_task = await ps.invoke_async(output_stream=out)
+        await out_received.wait()
+
+        on_stop = asyncio.Event()
+        stop_task = await ps.stop_async(completed=on_stop)
+        await on_stop.wait()
+        await stop_task
+
+        with pytest.raises(psrp.PipelineFailed, match="The pipeline has been stopped."):
+            await invoke_task
+
+        assert out == [1]
 
 
 @pytest.mark.skip
@@ -514,4 +664,21 @@ async def test_powershell_connect_async(psrp_async_proc: psrp.AsyncProcessInfo) 
 
 
 async def test_run_get_command_meta(psrp_async_proc: psrp.AsyncProcessInfo) -> None:
-    a = ""
+    async with psrp.AsyncRunspacePool(psrp_async_proc) as rp:
+        gcm = psrp.AsyncCommandMetaPipeline(
+            rp,
+            name="Get-*Item",
+            command_type=psrpcore.types.CommandTypes.Cmdlet,
+            namespace=["Microsoft.PowerShell.Management"],
+            arguments=["env:"],
+        )
+
+        actual = await gcm.invoke()
+        assert len(actual) == 3
+        assert isinstance(actual[0], psrpcore.types.CommandMetadataCount)
+
+        assert isinstance(actual[1], psrpcore.types.PSObject)
+        assert actual[1].Name == "Get-ChildItem"
+
+        assert isinstance(actual[2], psrpcore.types.PSObject)
+        assert actual[2].Name == "Get-Item"

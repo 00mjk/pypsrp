@@ -5,6 +5,12 @@
 import enum
 import typing as t
 
+import psrpcore
+
+
+class PSRPError(Exception):
+    """Base error class for psrp operations."""
+
 
 class WSManFaultCode(enum.IntEnum):
     """WSMan error codes.
@@ -51,7 +57,7 @@ class _WSManFaultRegistry(type):
         return super(_WSManFaultRegistry, new_cls).__call__(code=code, *args, **kwargs)
 
 
-class WSManFault(Exception, metaclass=_WSManFaultRegistry):
+class WSManFault(PSRPError, metaclass=_WSManFaultRegistry):
     CODE = WSManFaultCode.UNKNOWN
     MESSAGE = "Unknown WS-Management fault."
 
@@ -115,3 +121,14 @@ class OperationTimedOut(WSManFault):
 class ServiceStreamDisconnected(WSManFault):
     CODE = WSManFaultCode.SERVICE_STREAM_DISCONNECTED
     MESSAGE = "The WS-Management service cannot process the request because the stream is currently disconnected."
+
+
+class PipelineFailed(PSRPError):
+    """A pipeline failed to complete or was stopped."""
+
+    def __init__(
+        self,
+        error: psrpcore.types.ErrorRecord,
+    ) -> None:
+        super().__init__(str(error))
+        self.error = error
