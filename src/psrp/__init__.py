@@ -16,8 +16,8 @@ from psrp._connection.connection_info import (
 from psrp._connection.out_of_proc import AsyncOutOfProcInfo, OutOfProcInfo
 from psrp._connection.process import AsyncProcessInfo, ProcessInfo
 from psrp._connection.ssh import AsyncSSHInfo
-from psrp._connection.wsman import AsyncWSManInfo, WSManInfo
-from psrp._exceptions import PipelineFailed, PSRPError
+from psrp._connection.wsman import AsyncWSManInfo, WSManConnectionData, WSManInfo
+from psrp._exceptions import PipelineFailed, PipelineStopped, PSRPError
 from psrp._host import PSHost, PSHostRawUI, PSHostUI
 from psrp._sync import PowerShell, PSDataStream, RunspacePool
 
@@ -35,6 +35,7 @@ __all__ = [
     "OutOfProcInfo",
     "OutputBufferingMode",
     "PipelineFailed",
+    "PipelineStopped",
     "PowerShell",
     "ProcessInfo",
     "PSDataStream",
@@ -43,5 +44,6 @@ __all__ = [
     "PSHostUI",
     "PSRPError",
     "RunspacePool",
+    "WSManConnectionData",
     "WSManInfo",
 ]

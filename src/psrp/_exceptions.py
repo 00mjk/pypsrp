@@ -5,8 +5,6 @@
 import enum
 import typing as t
 
-import psrpcore
-
 
 class PSRPError(Exception):
     """Base error class for psrp operations."""
@@ -124,11 +122,8 @@ class ServiceStreamDisconnected(WSManFault):
 
 
 class PipelineFailed(PSRPError):
-    """A pipeline failed to complete or was stopped."""
+    """A pipeline failed to start/complete."""
 
-    def __init__(
-        self,
-        error: psrpcore.types.ErrorRecord,
-    ) -> None:
-        super().__init__(str(error))
-        self.error = error
+
+class PipelineStopped(PSRPError):
+    """A pipeline was stopped."""

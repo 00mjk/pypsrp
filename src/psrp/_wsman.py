@@ -63,7 +63,7 @@ class SignalCode(enum.Enum):
     CTRL_C = "http://schemas.microsoft.com/wbem/wsman/1/windows/shell/signal/ctrl_c"
     CTRL_BREAK = "http://schemas.microsoft.com/wbem/wsman/1/windows/shell/signal/ctrl_break"
     TERMINATE = "http://schemas.microsoft.com/wbem/wsman/1/windows/shell/signal/Terminate"
-    PS_CTRL_C = "powershell/signal/ctrl_c"
+    PS_CRTL_C = "powershell/signal/crtl_c"
 
 
 class WSManAction(enum.Enum):
@@ -261,7 +261,7 @@ class ReceiveResponseEvent(WSManEvent):
     def command_state(self) -> t.Optional[CommandState]:
         """Describes the current state of the command."""
         command_state = self._raw.find("s:Body/rsp:ReceiveResponse/rsp:CommandState", namespaces=NAMESPACES)
-        return CommandState(command_state.attrib["State"].upper()) if command_state is not None else None
+        return CommandState(command_state.attrib["State"]) if command_state is not None else None
 
     @property
     def streams(self) -> t.Dict[str, t.List[bytes]]:

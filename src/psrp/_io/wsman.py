@@ -147,7 +147,7 @@ def get_tls_server_end_point_hash(
 
 
 @dataclasses.dataclass(frozen=True)
-class WSManConnectionInfo:
+class WSManConnectionData:
     """WSMan Connection Details.
 
     This stores all the WSMan connection specific details that makes it simpler
@@ -383,7 +383,7 @@ class AsyncWSManTransport(httpx.AsyncBaseTransport):
     def __init__(
         self,
         url: httpx.URL,
-        connection_info: WSManConnectionInfo,
+        connection_info: WSManConnectionData,
     ) -> None:
         self._connection = httpcore.AsyncHTTPConnection(
             httpcore.Origin(url.raw_scheme, url.raw_host, url.port or 5985),
@@ -400,7 +400,9 @@ class AsyncWSManTransport(httpx.AsyncBaseTransport):
         self._context: t.Optional[spnego.ContextProxy] = None
         self._username = connection_info.username
         self._password = connection_info.password
-        self._encrypt = connection_info.encryption == "always" or url.scheme == "http"
+        self._encrypt = connection_info.encryption == "always" or (
+            connection_info.encryption == "auto" and url.scheme == "http"
+        )
         self._service = connection_info.negotiate_service
         self._hostname_override = connection_info.negotiate_hostname or url.host
         self._disable_cbt = not connection_info.negotiate_send_cbt
@@ -663,7 +665,7 @@ class AsyncWSManTransport(httpx.AsyncBaseTransport):
 class AsyncWSManConnection:
     def __init__(
         self,
-        connection_info: WSManConnectionInfo,
+        connection_info: WSManConnectionData,
     ) -> None:
         self.connection_uri = httpx.URL(connection_info.connection_uri)
 
@@ -749,7 +751,7 @@ class AsyncWSManConnection:
 class WSManConnection:
     def __init__(
         self,
-        connection_info: WSManConnectionInfo,
+        connection_info: WSManConnectionData,
     ) -> None:
         self.connection_uri = httpx.URL(connection_info.connection_uri)
 

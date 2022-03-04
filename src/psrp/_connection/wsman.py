@@ -9,7 +9,9 @@ import threading
 import typing as t
 import uuid
 import xml.etree.ElementTree as ElementTree
+from tkinter import E
 
+import psrpcore
 from psrpcore import ClientRunspacePool, PSRPPayload, StreamType
 from psrpcore.types import RunspacePoolState
 
@@ -23,7 +25,7 @@ from psrp._exceptions import (
     OperationTimedOut,
     ServiceStreamDisconnected,
 )
-from psrp._io.wsman import AsyncWSManConnection, WSManConnection, WSManConnectionInfo
+from psrp._io.wsman import AsyncWSManConnection, WSManConnection, WSManConnectionData
 from psrp._winrs import WinRS, enumerate_winrs, receive_winrs_enumeration
 from psrp._wsman import (
     NAMESPACES,
@@ -40,7 +42,7 @@ log = logging.getLogger(__name__)
 class WSManInfo(ConnectionInfo):
     def __init__(
         self,
-        connection_info: WSManConnectionInfo,
+        connection_info: WSManConnectionData,
         configuration_name: str = "Microsoft.PowerShell",
         buffer_mode: OutputBufferingMode = OutputBufferingMode.NONE,
         idle_timeout: t.Optional[int] = None,
@@ -74,14 +76,22 @@ class WSManInfo(ConnectionInfo):
             resp = self._connection.post(winrs.data_to_send())
             winrs.receive_data(resp)
 
-            # We don't get a RnuspacePool state change response on our receive listener so manually change the state.
+            # Ugly hack but WSMan does not send a RnuspacePool state change response on our receive listener so this
+            # does it manually to align with the other connection types.
             pool.state = RunspacePoolState.Closed
+            closed_event = psrpcore.PSRPEvent.create(
+                psrpcore.types.PSRPMessageType.RunspacePoolState,
+                psrpcore.types.RunspacePoolStateMsg(RunspaceState=pool.state),
+                pool.runspace_pool_id,
+            )
+            self.process_response(pool, closed_event)
 
             # Wait for the listener task(s) to complete and remove the RunspacePool from our internal table.
             for task_id in list(self._listener_tasks.keys()):
                 if task_id.startswith(f"{pool.runspace_pool_id}:"):
                     self._listener_tasks.pop(task_id).join()
 
+            self.process_response(pool, None)
             del self._runspace_table[pool.runspace_pool_id]
 
             # No more connections left, close the underlying connection.
@@ -120,7 +130,7 @@ class WSManInfo(ConnectionInfo):
         open_content = ElementTree.Element("creationXml", xmlns="http://schemas.microsoft.com/powershell")
         open_content.text = base64.b64encode(payload.data).decode()
         options = OptionSet()
-        options.add_option("protocolversion", pool.our_capability.protocolversion, {"MustComply": "true"})
+        options.add_option("protocolversion", str(pool.our_capability.protocolversion), {"MustComply": "true"})
         winrs.open(options, open_content)
 
         resp = self._connection.post(winrs.data_to_send())
@@ -150,7 +160,7 @@ class WSManInfo(ConnectionInfo):
         self,
         pool: ClientRunspacePool,
         pipeline_id: uuid.UUID,
-        signal_code: SignalCode = SignalCode.PS_CTRL_C,
+        signal_code: SignalCode = SignalCode.PS_CRTL_C,
     ) -> None:
         winrs = self._runspace_table[pool.runspace_pool_id]
 
@@ -173,7 +183,7 @@ class WSManInfo(ConnectionInfo):
             payload = t.cast(PSRPPayload, self.next_payload(pool))
 
             options = OptionSet()
-            options.add_option("protocolversion", pool.our_capability.protocolversion, {"MustComply": "true"})
+            options.add_option("protocolversion", str(pool.our_capability.protocolversion), {"MustComply": "true"})
 
             open_content = ElementTree.SubElement(
                 connect, "connectXml", xmlns="http://schemas.microsoft.com/powershell"
@@ -298,9 +308,6 @@ class WSManInfo(ConnectionInfo):
                 if event.command_state == CommandState.DONE:
                     break
 
-            if pipeline_id is None:
-                self.process_response(pool, None)
-
 
 class AsyncWSManInfo(AsyncConnectionInfo):
     """Async ConnectionInfo for WSMan.
@@ -315,7 +322,7 @@ class AsyncWSManInfo(AsyncConnectionInfo):
 
     def __init__(
         self,
-        connection_info: WSManConnectionInfo,
+        connection_info: WSManConnectionData,
         configuration_name: str = "Microsoft.PowerShell",
         buffer_mode: OutputBufferingMode = OutputBufferingMode.NONE,
         idle_timeout: t.Optional[int] = None,
@@ -349,8 +356,15 @@ class AsyncWSManInfo(AsyncConnectionInfo):
             resp = await self._connection.post(winrs.data_to_send())
             winrs.receive_data(resp)
 
-            # We don't get a RnuspacePool state change response on our receive listener so manually change the state.
+            # Ugly hack but WSMan does not send a RnuspacePool state change response on our receive listener so this
+            # does it manually to align with the other connection types.
             pool.state = RunspacePoolState.Closed
+            closed_event = psrpcore.PSRPEvent.create(
+                psrpcore.types.PSRPMessageType.RunspacePoolState,
+                psrpcore.types.RunspacePoolStateMsg(RunspaceState=pool.state),
+                pool.runspace_pool_id,
+            )
+            await self.process_response(pool, closed_event)
 
             # Wait for the listener task(s) to complete and remove the RunspacePool from our internal table.
             listen_tasks = []
@@ -359,6 +373,7 @@ class AsyncWSManInfo(AsyncConnectionInfo):
                     listen_tasks.append(self._listener_tasks.pop(task_id))
 
             await asyncio.gather(*listen_tasks)
+            await self.process_response(pool, None)
             del self._runspace_table[pool.runspace_pool_id]
 
             # No more connections left, close the underlying connection.
@@ -397,7 +412,7 @@ class AsyncWSManInfo(AsyncConnectionInfo):
         open_content = ElementTree.Element("creationXml", xmlns="http://schemas.microsoft.com/powershell")
         open_content.text = base64.b64encode(payload.data).decode()
         options = OptionSet()
-        options.add_option("protocolversion", pool.our_capability.protocolversion, {"MustComply": "true"})
+        options.add_option("protocolversion", str(pool.our_capability.protocolversion), {"MustComply": "true"})
         winrs.open(options, open_content)
 
         resp = await self._connection.post(winrs.data_to_send())
@@ -414,20 +429,27 @@ class AsyncWSManInfo(AsyncConnectionInfo):
         if not payload:
             return False
 
+        await self._listener_send(pool, payload, self._connection)
+        return True
+
+    async def _listener_send(
+        self,
+        pool: ClientRunspacePool,
+        payload: PSRPPayload,
+        connection: AsyncWSManConnection,
+    ) -> None:
         winrs = self._runspace_table[pool.runspace_pool_id]
 
         stream = "stdin" if payload.stream_type == StreamType.default else "pr"
         winrs.send(stream, payload.data, command_id=payload.pipeline_id)
-        resp = await self._connection.post(winrs.data_to_send())
+        resp = await connection.post(winrs.data_to_send())
         winrs.receive_data(resp)
-
-        return True
 
     async def signal(
         self,
         pool: ClientRunspacePool,
         pipeline_id: uuid.UUID,
-        signal_code: SignalCode = SignalCode.PS_CTRL_C,
+        signal_code: SignalCode = SignalCode.PS_CRTL_C,
     ) -> None:
         winrs = self._runspace_table[pool.runspace_pool_id]
 
@@ -450,7 +472,7 @@ class AsyncWSManInfo(AsyncConnectionInfo):
             payload = t.cast(PSRPPayload, self.next_payload(pool))
 
             options = OptionSet()
-            options.add_option("protocolversion", pool.our_capability.protocolversion, {"MustComply": "true"})
+            options.add_option("protocolversion", str(pool.our_capability.protocolversion), {"MustComply": "true"})
 
             open_content = ElementTree.SubElement(
                 connect, "connectXml", xmlns="http://schemas.microsoft.com/powershell"
@@ -546,11 +568,10 @@ class AsyncWSManInfo(AsyncConnectionInfo):
 
         async with AsyncWSManConnection(self._connection_info) as conn:
             while True:
-                winrs.receive("stdout", command_id=pipeline_id)
-
-                resp = await conn.post(winrs.data_to_send())
-                # TODO: Will the ReceiveResponse block if not all the fragments have been sent?
                 started.set()
+
+                winrs.receive("stdout", command_id=pipeline_id)
+                resp = await conn.post(winrs.data_to_send())
 
                 try:
                     event = t.cast(ReceiveResponseEvent, winrs.receive_data(resp))
@@ -559,18 +580,21 @@ class AsyncWSManInfo(AsyncConnectionInfo):
                     # Occurs when there has been no output after the OperationTimeout set, just repeat the request
                     continue
 
-                except (OperationAborted, ServiceStreamDisconnected) as e:
+                except (OperationAborted, ServiceStreamDisconnected):
                     # Received when the shell or pipeline has been closed
                     break
 
                 for psrp_data in event.streams.get("stdout", []):
                     msg = PSRPPayload(psrp_data, StreamType.default, pipeline_id)
-                    await self.process_response(pool, msg)
+
+                    payload: t.Optional[PSRPPayload] = None
+                    data_available = await self.process_response(pool, msg)
+                    if data_available:
+                        payload = self.next_payload(pool)
+
+                    if payload:
+                        await self._listener_send(pool, payload, self._connection)
 
                 # If the command is done then we've got nothing left to do here.
-                # TODO: do we need to surface the exit_code into the protocol.
                 if event.command_state == CommandState.DONE:
                     break
-
-            if pipeline_id is None:
-                await self.process_response(pool, None)

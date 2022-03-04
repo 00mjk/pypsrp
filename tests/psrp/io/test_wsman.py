@@ -34,5 +34,5 @@ from psrp._io import wsman
     ],
 )
 def test_connection_info_uri(args, kwargs, expected):
-    actual = wsman.WSManConnectionInfo(*args, **kwargs)
+    actual = wsman.WSManConnectionData(*args, **kwargs)
     assert actual.connection_uri == expected

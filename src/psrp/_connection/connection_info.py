@@ -130,22 +130,28 @@ class ConnectionInfo(_ConnectionInfoBase):
     def process_response(
         self,
         pool: ClientRunspacePool,
-        data: t.Optional[PSRPPayload] = None,
+        data: t.Optional[t.Union[PSRPEvent, PSRPPayload]] = None,
     ) -> bool:
         """Process an incoming PSRP payload.
 
         Processes any incoming PSRP payload received from the peer and invokes
         the pool callback function for any PSRP events inside that payload.
+        Typically a PSRPPayload is the expected data type but a PSRPEvent can
+        also be passed in for manual messages the connection wishes to send to
+        the pool.
 
         Args:
             pool: The Runspace Pool the payload is for.
-            data: The PSRPPayload to process. Will be None to signify no more
-                data is expected for this pool.
+            data: The PSRPPayload or PSRPEvent to process. Will be None to
+                signify no more data is expected for this pool.
 
         Returns:
             bool: More data has been added to be sent to the peer.
         """
         callback = self.__event_callback[pool.runspace_pool_id]
+
+        if isinstance(data, PSRPEvent):
+            return callback(data)
 
         if data:
             log.debug("PSRP Receive", data.data)
@@ -294,7 +300,7 @@ class ConnectionInfo(_ConnectionInfoBase):
             pool: The Runspace Pool to connect to.
             pipeline_id: If connecting to a pipeline, this is the pipeline id.
         """
-        raise NotImplementedError()
+        raise NotImplementedError("Disconnection operation not implemented on this connection type")
 
     def disconnect(
         self,
@@ -309,7 +315,7 @@ class ConnectionInfo(_ConnectionInfoBase):
         Args:
             pool: The Runspace Pool to disconnect.
         """
-        raise NotImplementedError()
+        raise NotImplementedError("Disconnection operation not implemented on this connection type")
 
     def reconnect(
         self,
@@ -324,7 +330,7 @@ class ConnectionInfo(_ConnectionInfoBase):
         Args:
             pool: The Runspace Pool to disconnect.
         """
-        raise NotImplementedError()
+        raise NotImplementedError("Disconnection operation not implemented on this connection type")
 
     def enumerate(self) -> t.Iterator[t.Tuple[uuid.UUID, t.List[uuid.UUID]]]:
         """Find Runspace Pools or Pipelines.
@@ -339,7 +345,7 @@ class ConnectionInfo(_ConnectionInfoBase):
                 contains the Runspace Pool ID with a list of all the pipeline
                 IDs for that Runspace Pool.
         """
-        raise NotImplementedError()
+        raise NotImplementedError("Disconnection operation not implemented on this connection type")
 
 
 class AsyncConnectionInfo(_ConnectionInfoBase):
@@ -370,22 +376,28 @@ class AsyncConnectionInfo(_ConnectionInfoBase):
     async def process_response(
         self,
         pool: ClientRunspacePool,
-        data: t.Optional[PSRPPayload] = None,
+        data: t.Optional[t.Union[PSRPEvent, PSRPPayload]] = None,
     ) -> bool:
         """Process an incoming PSRP payload.
 
         Processes any incoming PSRP payload received from the peer and invokes
         the pool callback coroutine for any PSRP events inside that payload.
+        Typically a PSRPPayload is the expected data type but a PSRPEvent can
+        also be passed in for manual messages the connection wishes to send to
+        the pool.
 
         Args:
             pool: The Runspace Pool the payload is for.
-            data: The PSRPPayload to process. Will be None to signify no more
-                data is expected for this pool.
+            data: The PSRPPayload or PSRPEvent to process. Will be None to
+                signify no more data is expected for this pool.
 
         Returns:
             bool: More data has been added to be sent to the peer.
         """
         callback = self.__event_callback[pool.runspace_pool_id]
+
+        if isinstance(data, PSRPEvent):
+            return await callback(data)
 
         if data:
             log.debug("PSRP Receive", data.data)
@@ -534,7 +546,7 @@ class AsyncConnectionInfo(_ConnectionInfoBase):
             pool: The Runspace Pool to connect to.
             pipeline_id: If connecting to a pipeline, this is the pipeline id.
         """
-        raise NotImplementedError()
+        raise NotImplementedError("Disconnection operation not implemented on this connection type")
 
     async def disconnect(
         self,
@@ -549,7 +561,7 @@ class AsyncConnectionInfo(_ConnectionInfoBase):
         Args:
             pool: The Runspace Pool to disconnect.
         """
-        raise NotImplementedError()
+        raise NotImplementedError("Disconnection operation not implemented on this connection type")
 
     async def reconnect(
         self,
@@ -564,7 +576,7 @@ class AsyncConnectionInfo(_ConnectionInfoBase):
         Args:
             pool: The Runspace Pool to disconnect.
         """
-        raise NotImplementedError()
+        raise NotImplementedError("Disconnection operation not implemented on this connection type")
 
     async def enumerate(self) -> t.AsyncIterator[t.Tuple[uuid.UUID, t.List[uuid.UUID]]]:
         """Find Runspace Pools or Pipelines.
@@ -579,5 +591,5 @@ class AsyncConnectionInfo(_ConnectionInfoBase):
                 that contains the Runspace Pool ID with a list of all the
                 pipeline IDs for that Runspace Pool.
         """
-        raise NotImplementedError()
+        raise NotImplementedError("Disconnection operation not implemented on this connection type")
         yield  # type: ignore[unreachable]  # The yield is needed for mypy to see this as an Iterator

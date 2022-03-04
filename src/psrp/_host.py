@@ -27,9 +27,7 @@ from psrpcore.types import (
 
 class MethodMetadata(typing.NamedTuple):
     is_void: bool  #: Whether the invoke function is expected to return value.
-    invoke: typing.Optional[
-        typing.Callable
-    ]  #: The callable that invokes the host method, None if the method was not found.
+    invoke: typing.Callable  #: The callable that invokes the host method, None if the method was not found.
 
 
 class PSHost:
@@ -500,21 +498,24 @@ def get_host_method(
         HostMethodIdentifier.ScrollBufferContents: ("scroll_buffer_contents", True, "raw_ui"),
     }[method_identifier]
 
+    def not_implemented() -> None:
+        raise NotImplementedError()
+
     if host_type in ["ui", "raw_ui"]:
         ui = getattr(host, "ui", None)
         if ui is None:
-            return MethodMetadata(is_void, None)
+            return MethodMetadata(is_void, not_implemented)
         host = ui
 
     if host_type in ["raw_ui"]:
         raw_ui = getattr(host, "raw_ui", None)
         if raw_ui is None:
-            return MethodMetadata(is_void, None)
+            return MethodMetadata(is_void, not_implemented)
         host = raw_ui
 
     raw_func = getattr(host, name, None)
     if raw_func is None:
-        return MethodMetadata(is_void, None)
+        return MethodMetadata(is_void, not_implemented)
 
     # The parameters for these methods in a PSRP specific format that don't strictly match the public .NET types.
     # This converts the method parameters to the public types and make a PSHost implementation easier for end users to

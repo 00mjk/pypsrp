@@ -3,6 +3,7 @@
 # MIT License (see LICENSE or https://opensource.org/licenses/MIT)
 
 import asyncio
+import logging
 import typing as t
 import uuid
 
@@ -51,12 +52,14 @@ from psrpcore.types import (
 
 from ._compat import iscoroutinefunction
 from ._connection.connection_info import AsyncConnectionInfo
-from ._exceptions import PipelineFailed
+from ._exceptions import PipelineFailed, PipelineStopped
 from ._host import PSHost, get_host_method
 
 PipelineType = t.TypeVar("PipelineType", bound=t.Union[ClientGetCommandMetadata, ClientPowerShell])
 EventType = t.TypeVar("EventType", bound=PSRPEvent)
 T = t.TypeVar("T")
+
+log = logging.getLogger(__name__)
 
 
 class AsyncPSDataCollection(t.Generic[T], t.List[T]):
@@ -205,7 +208,9 @@ class MessageResult(t.Generic[EventType]):
         Returns:
             EventType: The set event type.
         """
+        logging.debug("Waiting for %s", self._event_type)
         await self._event.wait()
+        logging.debug("Wait for %s complete", self._event_type)
 
         # An event is only set when _result is added
         return t.cast(EventType, self._result)
@@ -227,6 +232,7 @@ class MessageResult(t.Generic[EventType]):
             was set.
         """
         if isinstance(value, self._event_type) and (not self._condition or self._condition(value)):
+            logging.debug("Setting result for %s", self._event_type)
             self._result = value
             self._event.set()
             return True
@@ -467,6 +473,7 @@ class AsyncRunspacePool:
         Opens the Runspace Pool through the connection specified. A pool must
         be opened before it can be used.
         """
+        log.info("Opening Runspace Pool - %s", self._pool.runspace_pool_id)
         self._pool.open()
 
         state_event = MessageResult(RunspacePoolStateEvent)
@@ -480,9 +487,10 @@ class AsyncRunspacePool:
         Closes the Runspace Pool freeing any resources on the server.
         """
         if self.state != RunspacePoolState.Disconnected:
+            log.info("Closing Runspace Pool - %s", self._pool.runspace_pool_id)
             state_event = MessageResult(
                 RunspacePoolStateEvent,
-                lambda e: self.state != RunspacePoolState.Opened,
+                lambda e: e.state != RunspacePoolState.Opened,
             )
             self._result_handler.append(state_event)
 
@@ -508,6 +516,7 @@ class AsyncRunspacePool:
         input. This will still need to be called if receiving a secure string
         without having first sent one.
         """
+        log.info("Starting Runspace Pool Key Exchange - %s", self._pool.runspace_pool_id)
         event = MessageResult(EncryptedSessionKeyEvent)
         self._result_handler.append(event)
 
@@ -529,7 +538,7 @@ class AsyncRunspacePool:
             bool: Whether the reset was successful.
         """
         ci = self._pool.reset_runspace_state()
-        return await self._send_set_runspace_availability_ci(ci)
+        return await self._send_set_runspace_availability_ci(ci, "Resetting Runspace Pool State")
 
     async def set_max_runspaces(
         self,
@@ -552,7 +561,7 @@ class AsyncRunspacePool:
             bool: Whether the change was succesful or not.
         """
         ci = self._pool.set_max_runspaces(value)
-        return await self._send_set_runspace_availability_ci(ci)
+        return await self._send_set_runspace_availability_ci(ci, f"Setting maximum pool count to {value}")
 
     async def set_min_runspaces(
         self,
@@ -575,7 +584,7 @@ class AsyncRunspacePool:
             bool: Whether the change was succesful or not.
         """
         ci = self._pool.set_min_runspaces(value)
-        return await self._send_set_runspace_availability_ci(ci)
+        return await self._send_set_runspace_availability_ci(ci, f"Setting minimum pool count to {value}")
 
     async def get_available_runspaces(self) -> int:
         """Get the number of available runspaces.
@@ -590,6 +599,8 @@ class AsyncRunspacePool:
         self._result_handler.append(event)
 
         ci = self._pool.get_available_runspaces()
+
+        log.info("Getting available Runspace Pool Count - ci %s - %s", ci, self._pool.runspace_pool_id)
         await self.connection.send_all(self._pool)
         result = await event.wait()
 
@@ -602,6 +613,8 @@ class AsyncRunspacePool:
         if event.pipeline_id:
             pipeline = self.pipeline_table[event.pipeline_id]
             return await pipeline._event_received(event)
+
+        log.debug("Processing event for Runspace Pool - %r", event)
 
         queued_data = False
         if isinstance(event, RunspacePoolStateEvent):
@@ -643,6 +656,7 @@ class AsyncRunspacePool:
         event: t.Union[RunspacePoolHostCallEvent, PipelineHostCallEvent],
         error_stream: AsyncPSDataCollection[ErrorRecord],
     ) -> bool:
+        log.info("Invoking host call - %r", event)
         ci = event.ci
         mi = event.method_identifier
         mp = event.method_parameters
@@ -651,15 +665,13 @@ class AsyncRunspacePool:
 
         error_record = None
         try:
-            if not func:
-                raise NotImplementedError()
-
             if iscoroutinefunction(func):
                 return_value = await func()
             else:
                 return_value = func()
 
         except Exception as e:
+            log.warning("Failed to invoke host call - ci %s - %s", ci, e)
             setattr(e, "mi", mi)
 
             # Any failure for non-void methods should be propagated back to the peer.
@@ -690,9 +702,12 @@ class AsyncRunspacePool:
     async def _send_set_runspace_availability_ci(
         self,
         ci: t.Optional[int],
+        action: str,
     ) -> bool:
         if ci is None:
             return True
+
+        log.info("%s - ci %s - %s", action, ci, self._pool.runspace_pool_id)
 
         event = MessageResult(SetRunspaceAvailabilityEvent, lambda e: e.ci == ci)
         self._result_handler.append(event)
@@ -704,6 +719,8 @@ class AsyncRunspacePool:
 
 
 class AsyncPipeline(t.Generic[PipelineType]):
+    """Common Pipeline Operations."""
+
     def __init__(
         self,
         runspace_pool: AsyncRunspacePool,
@@ -721,15 +738,26 @@ class AsyncPipeline(t.Generic[PipelineType]):
         self._explicit_output = False
 
         self._close_lock = asyncio.Lock()
+        self._stop_lock = asyncio.Lock()
         self._pipeline: PipelineType = pipeline
         self._result_handler: t.List[MessageResult] = []
 
     @property
     def had_errors(self) -> bool:
+        """Whether the pipeline had errors.
+
+        This checks whether the pipeline had any errors added to the error
+        stream.
+
+        Note:
+            This is not True if the pipeline failed to run. This only checks
+            the error stream.
+        """
         return len(self.stream_error) > 0
 
     @property
     def state(self) -> PSInvocationState:
+        """The current pipeline state."""
         return self._pipeline.state
 
     async def close(self) -> None:
@@ -744,6 +772,7 @@ class AsyncPipeline(t.Generic[PipelineType]):
             if not pipeline or pipeline._pipeline.state == PSInvocationState.Disconnected:
                 return
 
+            log.info("Closing pipeline - %s", self._pipeline.pipeline_id)
             await self.runspace_pool.connection.close(self.runspace_pool._pool, self._pipeline.pipeline_id)
             del self.runspace_pool.pipeline_table[self._pipeline.pipeline_id]
 
@@ -754,7 +783,7 @@ class AsyncPipeline(t.Generic[PipelineType]):
     async def connect_async(
         self,
         output_stream: t.Optional[AsyncPSDataCollection[t.Any]] = None,
-        completed: t.Optional[asyncio.Event] = None,
+        completed: t.Optional[t.Callable[[], t.Awaitable[None]]] = None,
     ) -> asyncio.Task[t.List[t.Any]]:
         if output_stream is not None:
             self._explicit_output = True
@@ -782,13 +811,42 @@ class AsyncPipeline(t.Generic[PipelineType]):
     ) -> t.List[t.Any]:
         """Invoke the pipeline.
 
-        Invokes the pipeline and yields the output as it is received. This takes the same arguments as
-        :meth:`begin_invoke()` but instead of returning once the pipeline is started this will wait until it is
-        complete.
+        Invokes the pipeline on the associated Runspace Pool. If no
+        output_stream is defined then the output is returned as a list,
+        otherwise the output is added to the stream specified and this module
+        returns an empty list.
+
+        The function will wait until the pipeline has completed running, use
+        :meth:`invoke_async` to run a pipeline in the background.
+
+        The input_data can either be a normal iterable or async iterable.
+
+        Example:
+            Send input as a normal iterable
+
+            >>> await ps.invoke([1, 2])
+
+            Send input as an async iterable
+
+            >>> async def async_iter():
+            ...     yield 1
+            ...     await asyncio.sleep(5)
+            ...     yield 2
+            ...
+            >>> await ps.invoke(async_iter())
+
+        Args:
+            input_data: Any data to send as input to the first command in the
+                pipeline.
+            output_stream: Add any output data to this stream rather than
+                returning the output as a list.
+            buffer_input: Buffer the input data so it only sends the input once
+                it fills the buffer rather than send each input as it's own
+                individual message.
 
         Returns:
-            (t.AsyncIterable[PSObject]): An async iterable that can be iterated to receive the output objects as
-                they are received.
+            t.List[t.Any]: The output of the pipeline, will be an empty list
+            if output_stream is set.
         """
         output_task = await self.invoke_async(
             input_data=input_data,
@@ -801,24 +859,44 @@ class AsyncPipeline(t.Generic[PipelineType]):
         self,
         input_data: t.Optional[t.Union[t.Iterable, t.AsyncIterable]] = None,
         output_stream: t.Optional[AsyncPSDataCollection[t.Any]] = None,
-        completed: t.Optional[asyncio.Event] = None,
+        completed: t.Optional[t.Callable[[], t.Awaitable[None]]] = None,
         buffer_input: bool = True,
     ) -> asyncio.Task[t.List[t.Any]]:
-        """Begin the pipeline.
+        """Invoke the pipeline as a background task.
 
-        Begin the pipeline execution and returns an async iterable that yields the output as they are received.
+        Invokes the pipeline on the associated Runspace Pool and continues to
+        run it in a background task. The function will wait until the pipeline
+        details have been sent to the peer and all the input has been sent.
+        Once that is done a task is returned that can be awaited on for it to
+        complete.
+
+        The keyword arguments are the same as :meth:`invoke` except for the
+        addition of `completed` which is a coroutine that is called when the
+        pipeline has completed. This can be used to mark a stream as completed
+        if enumerating a blocking collection or do any other work.
+
+        Note:
+            The completed callback is run as part of the final steps of the
+            task. It cannot be used to await on invoke_async returned task or
+            start a new pipeline as that will cause a deadlock.
 
         Args:
-            input_data: A list of objects to send as the input to the pipeline. Can be a normal or async iterable.
-            output_stream:
-            completed:
-            buffer_input: Whether to buffer the input data and only send each object once the buffer is full (`True`)
-                or individually as separate PSRP messages (`False`).
+            input_data: Any data to send as input to the first command in the
+                pipeline.
+            output_stream: Add any output data to this stream rather than
+                returning the output as a list.
+            completed: A coroutine that is called once the task has completed
+                running.
+            buffer_input: Buffer the input data so it only sends the input once
+                it fills the buffer rather than send each input as it's own
+                individual message.
 
         Returns:
-            (t.AsyncIterable[PSObject]): An async iterable that can be iterated to receive the output objects as
-                they are received.
+            asyncio.Task[t.List[t.Any]]: Returns an asyncio Task that can be
+            awaited on to get the final output. If output_stream is specified
+            the return value of this task is an empty list.
         """
+        log.info("Starting pipeline - %s", self._pipeline.pipeline_id)
         if output_stream is not None:
             self._explicit_output = True
             self._stream_output = output_stream
@@ -841,6 +919,7 @@ class AsyncPipeline(t.Generic[PipelineType]):
         await self.runspace_pool.connection.send_all(pool)
 
         if input_data is not None:
+            log.debug("Sending pipeline input - %s", self._pipeline.pipeline_id)
 
             async def input_gen(
                 input_data: t.Union[t.Iterable, t.AsyncIterable],
@@ -866,6 +945,7 @@ class AsyncPipeline(t.Generic[PipelineType]):
                 else:
                     await self.runspace_pool.connection.send_all(pool)
 
+            log.debug("Sending pipeline input eof - %s", self._pipeline.pipeline_id)
             self._pipeline.send_eof()
             await self.runspace_pool.connection.send_all(pool)
 
@@ -874,27 +954,61 @@ class AsyncPipeline(t.Generic[PipelineType]):
     async def stop(self) -> None:
         """Stops a running pipeline.
 
-        Stops a running pipeline and waits for it to stop.
+        Sends a signal to stop the running pipeline and wait for it to stop.
+        The connect/invoke task await will raise a :class:`PipelineStopped`
+        exception to indicate it was stopped.
+
+        Use :meth:`stop_async` to send the stop signal but not wait for the
+        signal to be processed and the pipeline to be stopped.
+
+        Note:
+            A pipeline may not response to a stop signal if it is running a
+            non-PowerShell command, like a .NET function or native command. This
+            will block until the pipeline has a chance to respond to the signal
+            and stop it's operations.
         """
         task = await self.stop_async()
         await task
 
     async def stop_async(
         self,
-        completed: t.Optional[asyncio.Event] = None,
+        completed: t.Optional[t.Callable[[], t.Awaitable[None]]] = None,
     ) -> asyncio.Task:
-        task_ready = asyncio.Event()
-        task = asyncio.create_task(self._pipelines_task(task_ready, completed=completed, for_stop=True))
-        await task_ready.wait()
+        """Stops the pipeline as a background task.
 
-        await self.runspace_pool.connection.signal(self.runspace_pool._pool, self._pipeline.pipeline_id)
+        Will create a task that sends the background stop signal and wait for
+        it to complete all in a background task. This returned task can be
+        awaited to wait until the stop was processed and acknoledged by the
+        server otherwise it will continue to run in the background.
 
-        return task
+        Use :meth:`stop` to send the stop signal and wait until it is complete.
+
+        Args:
+            completed: A coroutine that is called once the task has completed
+                running and the signal was acknowledged by the server.
+
+        Returns:
+            asyncio.Task: Returns an asyncio Task that can be awaited on to
+            wait until the stop was processed and acknowledged by the server.
+        """
+        log.info("Stopping pipeline - %s", self._pipeline.pipeline_id)
+
+        async def inner_stop() -> None:
+            await self.runspace_pool.connection.signal(self.runspace_pool._pool, self._pipeline.pipeline_id)
+
+            if completed:
+                await completed()
+
+        # The signal call blocks until an Ack but stop_async should just send
+        # the signal and return a task that waits for the ack.
+        return asyncio.create_task(inner_stop())
 
     async def _event_received(
         self,
         event: PSRPEvent,
     ) -> bool:
+        log.debug("Processing event for Pipeline - %r", event)
+
         host = getattr(self, "host", None) or self.runspace_pool.host
         queued_data = False
 
@@ -934,27 +1048,60 @@ class AsyncPipeline(t.Generic[PipelineType]):
     async def _pipelines_task(
         self,
         ready: asyncio.Event,
-        completed: t.Optional[asyncio.Event] = None,
-        for_stop: bool = False,
+        completed: t.Optional[t.Callable[[], t.Awaitable[None]]] = None,
     ) -> t.List[t.Any]:
         event = MessageResult(PipelineStateEvent, lambda e: e.state != PSInvocationState.Running)
         self._result_handler.append(event)
         ready.set()
 
         state = await event.wait()
+        log.debug("Pipeline has ended - %r - %s", state, self._pipeline.pipeline_id)
 
         if completed:
-            completed.set()
+            await completed()
 
         await self.close()
 
-        if not for_stop and state.state in [PSInvocationState.Failed, PSInvocationState.Stopped]:
-            raise PipelineFailed(t.cast(ErrorRecord, state.reason))
+        # For some weird reason the state may not be present on a failed or
+        # stopped pipeline. Just replicate the error msg as best as it can.
+        if state.state == PSInvocationState.Failed:
+            err = str(state.reason) if state.reason else "Unknown failure."
+            raise PipelineFailed(err)
+
+        elif state.state == PSInvocationState.Stopped:
+            err = str(state.reason) if state.reason else "The pipeline has been stopped."
+            raise PipelineStopped(err)
 
         return [] if self._explicit_output else list(self._stream_output)
 
 
 class AsyncCommandMetaPipeline(AsyncPipeline[ClientGetCommandMetadata]):
+    """Get Command Metadata Pipeline.
+
+    A Pipeline that can retrieve command metadata in a Runspace Pool. This is
+    essentially a dedicated pipeline for the `Get-Command` cmdlet used in
+    PowerShell. The `Get-Command` cmdlet can still be used with
+    :class:`AsyncPowerShell`, this is just another mechanism to do the same
+    thing. The `Export-PSSession` uses this type of Pipeline when being called
+    through PowerShell.
+
+    FIXME: Add doc link to event subscribers.
+
+    Args:
+        runspace_pool: The RunspacePool the pipeline is associated with.
+        name: The names of the commands to search for. This accepts both a
+            string or list of strings and includes support for PowerShell's
+            wildcard matching using `*`, `?`, and `[]`.
+        command_type: The command types to search for.
+        namespace: The namespaces, modules to search in.
+        arguments: Arguments to apply to each command in order to get the
+            metadata of provider specific dynamic parameters.
+
+    Events:
+        state_changed: An event that is called when the Pipeline state has
+            changed.
+    """
+
     def __init__(
         self,
         runspace_pool: AsyncRunspacePool,
@@ -974,10 +1121,57 @@ class AsyncCommandMetaPipeline(AsyncPipeline[ClientGetCommandMetadata]):
 
 
 class AsyncPowerShell(AsyncPipeline[ClientPowerShell]):
+    """PowerShell Pipeline.
+
+    A Pipeline that executes PowerShell commands or scripts on a Runspace Pool.
+    This is the main pipeline type used in PowerShell Remoting and is designed
+    to replicate the .NET `PowerShell`_ class.
+
+    FIXME: Add doc link to event subscribers.
+
+    The pipeline contains a stream attribute for each PowerShell stream and the
+    output is either returned by the invoke() methods or added to the explicit
+    output pipeline passed into those methods.
+
+    A pipeline can be invoked multiple times and stream records are appended to
+    their respective streams. When a stream has been manually marked as complete
+    the records are dropped.
+
+    Args:
+        runspace_pool: The RunspacePool the pipeline is associated with.
+        apartment_state: ApartmentState of the thread in which the command is
+            executed.
+        history: If defined, this adds the string to the history of the Runspace
+            Pool the command is running in.
+        host: The PSHost to run the command with, if undefined it will use the
+            host of the Runspace Pool the command is running in.
+        is_nested: Whether this pipeline is nested to run inside another
+            pipeline.
+        remote_stream_options: Options for the error, warning, verbose, and
+            debug streams.
+        redirect_shell_error_to_out: Redirects the global error output pipe to
+            the commands error output pipe.
+
+    Attributes:
+        runspace_pool: The RunspacePool the pipeline is associated with.
+        stream_debug: The stream containing debug records.
+        stream_error: The stream containing error records.
+        stream_information: The stream containing information records.
+        stream_progress: The stream containing progress records.
+        stream_verbose: The stream containing verbose records.
+        stream_warning: The stream containing warning records.
+
+    Events:
+        state_changed: An event that is called when the Pipeline state has
+            changed.
+
+    .. _PowerShell:
+        https://docs.microsoft.com/en-us/dotnet/api/system.management.automation.powershell
+    """
+
     def __init__(
         self,
         runspace_pool: AsyncRunspacePool,
-        add_to_history: bool = False,
         apartment_state: t.Optional[ApartmentState] = None,
         history: t.Optional[str] = None,
         host: t.Optional[PSHost] = None,
@@ -987,7 +1181,7 @@ class AsyncPowerShell(AsyncPipeline[ClientPowerShell]):
     ) -> None:
         pipeline = ClientPowerShell(
             runspace_pool=runspace_pool._pool,
-            add_to_history=add_to_history,
+            add_to_history=history is not None,
             apartment_state=apartment_state,
             history=history,
             host=host.get_host_info() if host else None,
@@ -1002,6 +1196,17 @@ class AsyncPowerShell(AsyncPipeline[ClientPowerShell]):
         self,
         value: t.Any,
     ) -> "AsyncPowerShell":
+        """Add argument to the current command.
+
+        Adds a positional argument value to the current command in the
+        pipeline's command collection.
+
+        Args:
+            value: The value to use as the positional argument.
+
+        Returns:
+            AsyncPowerShell: The current PowerShell pipeline instance.
+        """
         self._pipeline.add_argument(value)
         return self
 
@@ -1010,6 +1215,29 @@ class AsyncPowerShell(AsyncPipeline[ClientPowerShell]):
         cmdlet: t.Union[str, Command],
         use_local_scope: t.Optional[bool] = None,
     ) -> "AsyncPowerShell":
+        """Add command to the pipeline.
+
+        Adds a new command to the current statement. Multiple commands in a
+        statement are piped together.
+
+        Example:
+            To replicate ``Get-Item -Path /tmp | Select-Object`` with this API.
+
+            >>> ps.add_command("Get-Item").add_parameter("Path", "/tmp")
+            >>> ps.add_command("Select-Object")
+
+        Use :meth:`add_statement` to separate commands that are run on separate
+        lines/statements.
+
+        Args:
+            cmdlet: The command to run as a str or the :class:psrpcore.Command`
+                object.
+            use_local_scope: Mark the command as running in the local scope of
+                the pipeline.
+
+        Returns:
+            AsyncPowerShell: The current PowerShell pipeline instance.
+        """
         self._pipeline.add_command(cmdlet, use_local_scope)
         return self
 
@@ -1018,6 +1246,21 @@ class AsyncPowerShell(AsyncPipeline[ClientPowerShell]):
         name: str,
         value: t.Any,
     ) -> "AsyncPowerShell":
+        """Add parameter to the command.
+
+        Adds a parameter and value to the current command in the pipeline's
+        command collection.
+
+        Note:
+            For switch parameter, use True or False as the value.
+
+        Args:
+            name: The name of the parameter.
+            value: The value of the parameter to add.
+
+        Returns:
+            AsyncPowerShell: The current PowerShell pipeline instance.
+        """
         self._pipeline.add_parameter(name, value)
         return self
 
@@ -1025,6 +1268,18 @@ class AsyncPowerShell(AsyncPipeline[ClientPowerShell]):
         self,
         **parameters: t.Any,
     ) -> "AsyncPowerShell":
+        """Add multiple parameters to the command.
+
+        Adds multiple parameters to the current command in the pipeline's
+        command collection.
+
+        Args:
+            parameters: Each keyword is treated as the parameter name with its
+                value.
+
+        Returns:
+            AsyncPowerShell: The current PowerShell pipeline instance.
+        """
         self._pipeline.add_parameters(**parameters)
         return self
 
@@ -1033,10 +1288,33 @@ class AsyncPowerShell(AsyncPipeline[ClientPowerShell]):
         script: str,
         use_local_scope: t.Optional[bool] = None,
     ) -> "AsyncPowerShell":
+        """Add a script to the pipeline.
+
+        Adds a free form script to the current statement. Like
+        :meth:`add_command` this script is added on a statement and multiple
+        scripts/commands in the same statement are piped together. Use
+        :meth:`add_statement` to separate commands and scripts from each other.
+
+        Args:
+            script: The script to run.
+            use_local_scope: Mark the script as running in the local scope of
+                the pipeline.
+
+        Returns:
+            AsyncPowerShell: The current PowerShell pipeline instance.
+        """
         self._pipeline.add_script(script, use_local_scope)
         return self
 
     def add_statement(self) -> "AsyncPowerShell":
+        """Add a new statement to the pipeline.
+
+        Adds a new satement to separate commands and scripts from each other.
+        This is akin to using a semicolon or newline in a script.
+
+        Returns:
+            AsyncPowerShell: The current PowerShell pipeline instance.
+        """
         self._pipeline.add_statement()
         return self
 
@@ -1044,7 +1322,7 @@ class AsyncPowerShell(AsyncPipeline[ClientPowerShell]):
         self,
         input_data: t.Optional[t.Union[t.Iterable, t.AsyncIterable]] = None,
         output_stream: t.Optional[AsyncPSDataCollection[t.Any]] = None,
-        completed: t.Optional[asyncio.Event] = None,
+        completed: t.Optional[t.Callable[[], t.Awaitable[None]]] = None,
         buffer_input: bool = True,
     ) -> asyncio.Task[t.List[t.Any]]:
         self._pipeline.metadata.no_input = input_data is None
