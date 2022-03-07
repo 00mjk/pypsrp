@@ -2,6 +2,7 @@
 # Copyright: (c) 2022, Jordan Borean (@jborean93) <jborean93@gmail.com>
 # MIT License (see LICENSE or https://opensource.org/licenses/MIT)
 
+import base64
 import enum
 import logging
 import typing as t
@@ -62,7 +63,7 @@ class _ConnectionInfoBase:
         Returns:
             int: The max fragment size.
         """
-        return 32_768
+        return 32_768  # Used as a default for all OutOfProc transports.
 
     def next_payload(
         self,
@@ -75,11 +76,11 @@ class _ConnectionInfoBase:
 
         Args:
             pool: The Runspace Pool to get the next payload for.
-            buffer: Wait until the buffer as set by `self.fragment_size` has
-                been reached before sending the payload.
+            buffer: Wait until the buffer as set by :meth:`get_fragment_size`
+                has been reached before sending the payload.
 
         Returns:
-            Optional[PSRPPayload]: The transport payload to send if there is
+            Optional[PSRPPayload]: The PSRP payload to send if there is
                 one.
         """
         pool_buffer = self.__buffer.setdefault(pool.runspace_pool_id, bytearray())
@@ -92,7 +93,6 @@ class _ConnectionInfoBase:
         if buffer and len(pool_buffer) < fragment_size:
             return None
 
-        log.debug("PSRP Send", pool_buffer)
         # No longer need the buffer for now
         del self.__buffer[pool.runspace_pool_id]
         return PSRPPayload(
@@ -103,6 +103,8 @@ class _ConnectionInfoBase:
 
 
 class ConnectionInfo(_ConnectionInfoBase):
+    """Base class used for synchronous connection info implementations."""
+
     def __init__(
         self,
     ) -> None:
@@ -146,18 +148,22 @@ class ConnectionInfo(_ConnectionInfoBase):
                 signify no more data is expected for this pool.
 
         Returns:
-            bool: More data has been added to be sent to the peer.
+            bool: A response has been queued on the internal pool that needs to
+                be sent to the peer.
         """
         callback = self.__event_callback[pool.runspace_pool_id]
 
         if isinstance(data, PSRPEvent):
+            log.debug("Calling Pool callback for %s - %r", pool.runspace_pool_id, data)
             return callback(data)
 
         if data:
-            log.debug("PSRP Receive", data.data)
+            if log.isEnabledFor(logging.DEBUG):
+                log.debug("Processing PSRP data %s", base64.b64encode(data.data).decode())
             pool.receive_data(data)
 
         else:
+            log.debug("Received close signal for pool %s", pool.runspace_pool_id)
             del self.__event_callback[pool.runspace_pool_id]
 
         data_queued = False
@@ -166,6 +172,7 @@ class ConnectionInfo(_ConnectionInfoBase):
             if not event:
                 break
 
+            log.debug("Calling Pool callback for %s - %r", pool.runspace_pool_id, event)
             res = callback(event)
             if res:
                 data_queued = True
@@ -184,8 +191,8 @@ class ConnectionInfo(_ConnectionInfoBase):
         """Close the Runspace Pool/Pipeline.
 
         Closes the Runspace Pool or Pipeline inside the Runspace Pool. This
-            should also close the underlying connection if no more resources
-            are being used.
+        should also close the underlying connection if no more resources are
+        being used.
 
         Args:
             pool: The Runspace Pool to close.
@@ -201,9 +208,7 @@ class ConnectionInfo(_ConnectionInfoBase):
         """Create the pipeline.
 
         Creates a pipeline in the Runspace Pool. This should send the first
-        fragment of the
-        :class:`CreatePipeline <psrp.dotnet.psrp_messages.CreatePipeline>` PSRP
-        message.
+        fragment of the `CreatePipeline` PSRP message.
 
         Args:
             pool: The Runspace Pool to create the pipeline in.
@@ -218,10 +223,8 @@ class ConnectionInfo(_ConnectionInfoBase):
         """Create the Runspace Pool
 
         Creates the Runspace Pool specified. This should send only one fragment
-        that contains at least the
-        :class:`SessionCapability <psrp.dotnet.psrp_messages.SessionCapability>`
-        PSRP message. The underlying connection should also be done if not
-        already done so.
+        that contains at least the `SessionCapability` PSRP message. If more
+        fragments can fit inside the payload they should also be sent.
 
         Args:
             pool: The Runspace Pool to create.
@@ -273,7 +276,7 @@ class ConnectionInfo(_ConnectionInfoBase):
         """Send a signal to the Runspace Pool/Pipeline
 
         Sends a signal to the Runspace Pool or Pipeline. Currently PSRP only
-        uses a signal to a Pipeline to ask the server to stop.
+        uses a signal to a Pipeline to request the pipeline to stop.
 
         Args:
             pool: The Runspace Pool that contains the pipeline to signal.
@@ -337,7 +340,7 @@ class ConnectionInfo(_ConnectionInfoBase):
 
         Find all the Runspace Pools or Pipelines on the connection. This is
         used to enumerate any disconnected Runspace Pools or Pipelines for
-        `:meth:connect()` and `:meth:reconnect()`. This is an optional feature
+        :meth:`connect` and :meth:`reconnect`. This is an optional feature
         that does not have to be implemented for the core PSRP scenarios.
 
         Returns:
@@ -349,6 +352,8 @@ class ConnectionInfo(_ConnectionInfoBase):
 
 
 class AsyncConnectionInfo(_ConnectionInfoBase):
+    """Base class used for asyncio connection info implementations."""
+
     def __init__(
         self,
     ) -> None:
@@ -392,18 +397,22 @@ class AsyncConnectionInfo(_ConnectionInfoBase):
                 signify no more data is expected for this pool.
 
         Returns:
-            bool: More data has been added to be sent to the peer.
+            bool: A response has been queued on the internal pool that needs to
+                be sent to the peer.
         """
         callback = self.__event_callback[pool.runspace_pool_id]
 
         if isinstance(data, PSRPEvent):
+            log.debug("Calling Pool callback for %s - %r", pool.runspace_pool_id, data)
             return await callback(data)
 
         if data:
-            log.debug("PSRP Receive", data.data)
+            if log.isEnabledFor(logging.DEBUG):
+                log.debug("Processing PSRP data %s", base64.b64encode(data.data).decode())
             pool.receive_data(data)
 
         else:
+            log.debug("Received close signal for pool %s", pool.runspace_pool_id)
             del self.__event_callback[pool.runspace_pool_id]
 
         data_queued = False
@@ -412,6 +421,7 @@ class AsyncConnectionInfo(_ConnectionInfoBase):
             if not event:
                 break
 
+            log.debug("Calling Pool callback for %s - %r", pool.runspace_pool_id, event)
             res = await callback(event)
             if res:
                 data_queued = True
@@ -430,8 +440,8 @@ class AsyncConnectionInfo(_ConnectionInfoBase):
         """Close the Runspace Pool/Pipeline.
 
         Closes the Runspace Pool or Pipeline inside the Runspace Pool. This
-            should also close the underlying connection if no more resources
-            are being used.
+        should also close the underlying connection if no more resources are
+        being used.
 
         Args:
             pool: The Runspace Pool to close.
@@ -447,9 +457,7 @@ class AsyncConnectionInfo(_ConnectionInfoBase):
         """Create the pipeline.
 
         Creates a pipeline in the Runspace Pool. This should send the first
-        fragment of the
-        :class:`CreatePipeline <psrp.dotnet.psrp_messages.CreatePipeline>` PSRP
-        message.
+        fragment of the `CreatePipeline` PSRP message.
 
         Args:
             pool: The Runspace Pool to create the pipeline in.
@@ -464,10 +472,8 @@ class AsyncConnectionInfo(_ConnectionInfoBase):
         """Create the Runspace Pool
 
         Creates the Runspace Pool specified. This should send only one fragment
-        that contains at least the
-        :class:`SessionCapability <psrp.dotnet.psrp_messages.SessionCapability>`
-        PSRP message. The underlying connection should also be done if not
-        already done so.
+        that contains at least the `SessionCapability` PSRP message. If more
+        fragments can fit inside the payload they should also be sent.
 
         Args:
             pool: The Runspace Pool to create.
@@ -519,7 +525,7 @@ class AsyncConnectionInfo(_ConnectionInfoBase):
         """Send a signal to the Runspace Pool/Pipeline
 
         Sends a signal to the Runspace Pool or Pipeline. Currently PSRP only
-        uses a signal to a Pipeline to ask the server to stop.
+        uses a signal to a Pipeline to request the pipeline to stop.
 
         Args:
             pool: The Runspace Pool that contains the pipeline to signal.
@@ -583,7 +589,7 @@ class AsyncConnectionInfo(_ConnectionInfoBase):
 
         Find all the Runspace Pools or Pipelines on the connection. This is
         used to enumerate any disconnected Runspace Pools or Pipelines for
-        `:meth:connect()` and `:meth:reconnect()`. This is an optional feature
+        :meth:`connect` and :meth:`reconnect`. This is an optional feature
         that does not have to be implemented for the core PSRP scenarios.
 
         Returns:

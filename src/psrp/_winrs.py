@@ -60,7 +60,7 @@ def receive_winrs_enumeration(
                 shell = WinRS(wsman, no_profile=not profile_loaded)
                 shell._parse_shell_create(raw, base_element="")
                 shell.selector_set = SelectorSet()
-                shell.selector_set.add_option("ShellId", shell.shell_id)  # type: ignore[arg-type]
+                shell.selector_set.add_option("ShellId", str(shell.shell_id).upper())
                 shells.append(shell)
 
             else:
@@ -88,7 +88,7 @@ class WinRS:
     ):
         self.wsman = wsman
         self.resource_uri = resource_uri
-        self.shell_id = uuid.UUID(shell_id)
+        self.shell_id = uuid.UUID(shell_id) if shell_id else uuid.UUID(int=0)
         self.input_streams = input_streams
         self.output_streams = output_streams
         self.codepage = codepage
@@ -97,11 +97,13 @@ class WinRS:
         self.lifetime = lifetime
         self.name = name
         self.no_profile = no_profile
+        self.process_id = -1
         self.working_directory = working_directory
         self.owner: t.Optional[str] = None
         self.client_ip: t.Optional[str] = None
         self.shell_run_time: t.Optional[str] = None
         self.shell_inactivity: t.Optional[str] = None
+        self.state = ""
         self.selector_set: t.Optional[SelectorSet] = None
 
     def data_to_send(
@@ -254,21 +256,24 @@ class WinRS:
         base_element: str = "s:Body/rsp:Shell/",
     ) -> None:
         """Process a WSMan Create response."""
-        fields = {
-            "rsp:ShellId": "shell_id",
-            "rsp:ResourceUri": "resource_uri",
-            "rsp:Owner": "owner",
-            "rsp:ClientIP": "client_ip",
-            "rsp:IdleTimeOut": "idle_time_out",
-            "rsp:InputStreams": "input_streams",
-            "rsp:OutputStreams": "output_streams",
-            "rsp:ShellRunTime": "shell_run_time",
-            "rsp:ShellInactivity": "shell_inactivity",
-        }
-        for xml_element, shell_attr in fields.items():
+        fields = [
+            ("rsp:ShellId", "shell_id", uuid.UUID),
+            ("rsp:ResourceUri", "resource_uri", str),
+            ("rsp:Owner", "owner", str),
+            ("rsp:ClientIP", "client_ip", str),
+            ("rsp:IdleTimeOut", "idle_time_out", str),
+            ("rsp:InputStreams", "input_streams", str),
+            ("rsp:OutputStreams", "output_streams", str),
+            ("rsp:ProcessId", "process_id", int),
+            ("rsp:ShellRunTime", "shell_run_time", str),
+            ("rsp:ShellInactivity", "shell_inactivity", str),
+            ("rsp:State", "state", str),
+        ]
+        for xml_element, shell_attr, target_type in fields:
             element = response.find(f"{base_element}{xml_element}", NAMESPACES)
             if element is not None:
-                setattr(self, shell_attr, element.text)
+                value: t.Any = target_type(element.text)
+                setattr(self, shell_attr, value)
 
         selector_set = response.find("wst:ResourceCreated/wsa:ReferenceParameters/wsman:SelectorSet", NAMESPACES)
         if selector_set is not None:

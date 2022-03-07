@@ -26,6 +26,7 @@ from psrpcore import (
     ProgressRecordEvent,
     PSRPEvent,
     RunspacePoolHostCallEvent,
+    RunspacePoolInitDataEvent,
     RunspacePoolStateEvent,
     SessionCapabilityEvent,
     SetRunspaceAvailabilityEvent,
@@ -60,6 +61,18 @@ EventType = t.TypeVar("EventType", bound=PSRPEvent)
 T = t.TypeVar("T")
 
 log = logging.getLogger(__name__)
+
+
+async def _wrap_invoke(
+    callable: t.Callable[..., t.Awaitable[None]],
+    *args: t.Any,
+    purpose: str = "",
+    **kwargs: t.Any,
+) -> None:
+    try:
+        await callable(*args, **kwargs)
+    except Exception:
+        log.exception(f"Failed to invoke callback for {purpose}")
 
 
 class AsyncPSDataCollection(t.Generic[T], t.List[T]):
@@ -108,9 +121,9 @@ class AsyncPSDataCollection(t.Generic[T], t.List[T]):
         self.blocking_iterator = blocking_iterator
         self.completed = False
 
-        self.on_completed = AsyncEventHandler[bool]()
-        self.data_added = AsyncEventHandler[T]()
-        self.data_adding = AsyncEventHandler[T]()
+        self.on_completed = AsyncEventHandler[bool]("PSDataCollection on_completed")
+        self.data_added = AsyncEventHandler[T]("PSDataCollection data_added")
+        self.data_adding = AsyncEventHandler[T]("PSDataCollection data_adding")
 
         self._add_condition = asyncio.Condition()
 
@@ -208,9 +221,9 @@ class MessageResult(t.Generic[EventType]):
         Returns:
             EventType: The set event type.
         """
-        logging.debug("Waiting for %s", self._event_type)
+        log.debug("Waiting for %s", self._event_type)
         await self._event.wait()
-        logging.debug("Wait for %s complete", self._event_type)
+        log.debug("Wait for %s complete", self._event_type)
 
         # An event is only set when _result is added
         return t.cast(EventType, self._result)
@@ -232,7 +245,7 @@ class MessageResult(t.Generic[EventType]):
             was set.
         """
         if isinstance(value, self._event_type) and (not self._condition or self._condition(value)):
-            logging.debug("Setting result for %s", self._event_type)
+            log.debug("Setting result for %s", self._event_type)
             self._result = value
             self._event.set()
             return True
@@ -262,15 +275,19 @@ class AsyncEventHandler(t.Generic[T]):
         main loop until they are complete.
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        purpose: str,
+    ) -> None:
         self._callbacks: t.List[t.Callable[[T], t.Awaitable[None]]] = []
+        self._purpose = purpose
 
     async def __call__(
         self,
         event: T,
     ) -> None:
         for callback in self._callbacks:
-            await callback(event)
+            await _wrap_invoke(callback, event, purpose=self._purpose)
 
     def __iadd__(
         self,
@@ -359,8 +376,8 @@ class AsyncRunspacePool:
         self.connection = connection
         self.host = host
         self.pipeline_table: t.Dict[uuid.UUID, AsyncPipeline] = {}
-        self.state_changed = AsyncEventHandler[RunspacePoolStateEvent]()
-        self.user_event = AsyncEventHandler[UserEventEvent]()
+        self.state_changed = AsyncEventHandler[RunspacePoolStateEvent]("RunspacePool state_changed")
+        self.user_event = AsyncEventHandler[UserEventEvent]("RunspacePool user_event")
 
         # Typically these streams are not received on a Runspace but Exchange Online has emitted a warning record here
         # and the error stream is used for failed host call information.
@@ -448,7 +465,7 @@ class AsyncRunspacePool:
             sess_event = MessageResult(SessionCapabilityEvent)
             self._result_handler.append(sess_event)
 
-            init_event = MessageResult(InitRunspacePoolEvent)
+            init_event = MessageResult(RunspacePoolInitDataEvent)
             self._result_handler.append(init_event)
 
             data_event = MessageResult(ApplicationPrivateDataEvent)
@@ -494,9 +511,9 @@ class AsyncRunspacePool:
             )
             self._result_handler.append(state_event)
 
-            tasks = [p.close() for p in self.pipeline_table.values()]
-            tasks.append(self.connection.close(self._pool))
-            await asyncio.gather(*tasks)
+            for p in list(self.pipeline_table.values()):
+                await p.close()
+            await self.connection.close(self._pool)
             await state_event.wait()
 
     async def disconnect(self) -> None:
@@ -671,7 +688,7 @@ class AsyncRunspacePool:
                 return_value = func()
 
         except Exception as e:
-            log.warning("Failed to invoke host call - ci %s - %s", ci, e)
+            log.exception("Failed to invoke host call - ci %s", ci)
             setattr(e, "mi", mi)
 
             # Any failure for non-void methods should be propagated back to the peer.
@@ -727,7 +744,7 @@ class AsyncPipeline(t.Generic[PipelineType]):
         pipeline: PipelineType,
     ) -> None:
         self.runspace_pool = runspace_pool
-        self.state_changed = AsyncEventHandler[PipelineStateEvent]()
+        self.state_changed = AsyncEventHandler[PipelineStateEvent]("Pipeline state_changed")
         self.stream_debug = AsyncPSDataCollection[DebugRecord]()
         self.stream_error = AsyncPSDataCollection[ErrorRecord]()
         self.stream_information = AsyncPSDataCollection[InformationRecord]()
@@ -997,7 +1014,7 @@ class AsyncPipeline(t.Generic[PipelineType]):
             await self.runspace_pool.connection.signal(self.runspace_pool._pool, self._pipeline.pipeline_id)
 
             if completed:
-                await completed()
+                await _wrap_invoke(completed, purpose="stop_async")
 
         # The signal call blocks until an Ack but stop_async should just send
         # the signal and return a task that waits for the ack.
@@ -1058,7 +1075,7 @@ class AsyncPipeline(t.Generic[PipelineType]):
         log.debug("Pipeline has ended - %r - %s", state, self._pipeline.pipeline_id)
 
         if completed:
-            await completed()
+            await _wrap_invoke(completed, purpose="pipeline task completion")
 
         await self.close()
 

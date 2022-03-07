@@ -1,5 +1,6 @@
 import asyncio
 import datetime
+import logging
 import typing as t
 
 import psrpcore
@@ -96,9 +97,35 @@ async def test_runspace_set_min_max(conn: str, request: pytest.FixtureRequest) -
         assert actual
 
 
-@pytest.mark.skip
 async def test_runspace_disconnect(psrp_async_wsman: psrp.AsyncWSManInfo) -> None:
-    raise NotImplementedError("Need WSMan connection")
+    async with psrp.AsyncRunspacePool(psrp_async_wsman) as rp:
+        assert rp.state == psrpcore.types.RunspacePoolState.Opened
+        await rp.disconnect()
+        assert rp.state == psrpcore.types.RunspacePoolState.Disconnected
+
+    assert rp.state == psrpcore.types.RunspacePoolState.Disconnected
+
+    async with rp:
+        assert rp.state == psrpcore.types.RunspacePoolState.Opened
+        await rp.disconnect()
+
+    assert rp.state == psrpcore.types.RunspacePoolState.Disconnected
+
+    async for rp in psrp.AsyncRunspacePool.get_runspace_pools(psrp_async_wsman):
+        assert rp.state == psrpcore.types.RunspacePoolState.Disconnected
+
+        async with rp:
+            assert rp.state == psrpcore.types.RunspacePoolState.Opened
+
+        assert rp.state == psrpcore.types.RunspacePoolState.Closed
+
+
+async def test_runspace_disconnect_unsupported(psrp_async_proc: psrp.AsyncProcessInfo) -> None:
+    async with psrp.AsyncRunspacePool(psrp_async_proc) as rp:
+        with pytest.raises(
+            NotImplementedError, match="Disconnection operation not implemented on this connection type"
+        ):
+            await rp.disconnect()
 
 
 @pytest.mark.parametrize("conn", ["proc", "ssh", "wsman"])
@@ -145,10 +172,17 @@ async def test_runspace_host_call(
     mocker: pytest_mock.MockerFixture,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    write_line_event = asyncio.Event()
+
     rp_host = psrp.PSHost(ui=psrp.PSHostUI())
     rp_write_line = mocker.MagicMock()
+
+    def write_line(line: str) -> None:
+        write_line_event.set()
+        rp_write_line(line)
+
     monkeypatch.setattr(rp_host.ui, "read_line", lambda: "runspace line")
-    monkeypatch.setattr(rp_host.ui, "write_line2", rp_write_line)
+    monkeypatch.setattr(rp_host.ui, "write_line2", write_line)
 
     ps_host = psrp.PSHost(ui=psrp.PSHostUI())
     ps_write_line = mocker.MagicMock()
@@ -166,7 +200,10 @@ async def test_runspace_host_call(
             $rsHost.UI.WriteLine("host output")
             """
         )
-        actual = await ps.invoke()
+        task = await ps.invoke_async()
+        await write_line_event.wait()
+
+        actual = await task
         assert actual == ["runspace line"]
         rp_write_line.assert_called_once_with("host output")
         ps_write_line.assert_not_called()
@@ -176,7 +213,15 @@ async def test_runspace_host_call(
 async def test_runspace_host_call_failure(
     conn: str, request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    write_line_event = asyncio.Event()
+
     rp_host = psrp.PSHost(ui=psrp.PSHostUI())
+
+    def write_line(line: str) -> None:
+        write_line_event.set()
+        raise NotImplementedError()
+
+    monkeypatch.setattr(rp_host.ui, "write_line2", write_line)
 
     connection = request.getfixturevalue(f"psrp_async_{conn}")
     async with psrp.AsyncRunspacePool(connection, host=rp_host) as rp:
@@ -188,7 +233,10 @@ async def test_runspace_host_call_failure(
             $rsHost.UI.WriteLine("host output")
             """
         )
-        actual = await ps.invoke()
+        task = await ps.invoke_async()
+        await write_line_event.wait()
+
+        actual = await task
         assert actual == []
         assert ps.stream_error == []
         assert len(rp.stream_error) == 1
@@ -243,6 +291,68 @@ async def test_runspace_user_event(conn: str, request: pytest.FixtureRequest) ->
 
         await ps.invoke()
         assert len(callback.events) == 2
+
+
+@pytest.mark.parametrize("conn", ["proc", "ssh", "wsman"])
+async def test_runspace_powershell_event_exception(
+    conn: str,
+    request: pytest.FixtureRequest,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.ERROR, logger="psrp._async")
+
+    async def failure_callback(event: psrpcore.PSRPEvent) -> None:
+        raise Exception("unknown failure")
+
+    connection = request.getfixturevalue(f"psrp_async_{conn}")
+    rp = psrp.AsyncRunspacePool(connection)
+    rp.user_event += failure_callback
+    rp.state_changed += failure_callback
+
+    async with rp:
+        ps = psrp.AsyncPowerShell(rp)
+        ps.state_changed += failure_callback
+
+        ps.add_script(
+            """
+            $null = $Host.Runspace.Events.SubscribeEvent(
+                $null,
+                "EventIdentifier",
+                "EventIdentifier",
+                $null,
+                $null,
+                $true,
+                $true)
+            $null = $Host.Runspace.Events.GenerateEvent(
+                "EventIdentifier",
+                "sender",
+                @("my", "args"),
+                "extra data")
+            # Ensure the event comes before the script ends
+            Start-Sleep -Milliseconds 500
+            """
+        )
+        await ps.invoke()
+
+        assert len(caplog.records) == 3
+
+        assert caplog.records[0].levelname == "ERROR"
+        assert caplog.records[0].message == "Failed to invoke callback for RunspacePool state_changed"
+        assert isinstance(caplog.records[0].exc_info, tuple)
+        assert isinstance(caplog.records[0].exc_info[1], Exception)
+        assert str(caplog.records[0].exc_info[1]) == "unknown failure"
+
+        assert caplog.records[1].levelname == "ERROR"
+        assert caplog.records[1].message == "Failed to invoke callback for RunspacePool user_event"
+        assert isinstance(caplog.records[1].exc_info, tuple)
+        assert isinstance(caplog.records[1].exc_info[1], Exception)
+        assert str(caplog.records[1].exc_info[1]) == "unknown failure"
+
+        assert caplog.records[2].levelname == "ERROR"
+        assert caplog.records[2].message == "Failed to invoke callback for Pipeline state_changed"
+        assert isinstance(caplog.records[2].exc_info, tuple)
+        assert isinstance(caplog.records[2].exc_info[1], Exception)
+        assert str(caplog.records[2].exc_info[1]) == "unknown failure"
 
 
 @pytest.mark.parametrize("conn", ["proc", "ssh", "wsman"])
@@ -463,6 +573,52 @@ async def test_powershell_stream_events(conn: str, request: pytest.FixtureReques
         assert len(callbacks.data) == 5
         assert isinstance(callbacks.data[4], psrpcore.PipelineStateEvent)
         assert len(ps.stream_verbose) == 1
+
+
+@pytest.mark.parametrize("conn", ["proc", "ssh", "wsman"])
+async def test_powershell_stream_events_exception(
+    conn: str,
+    request: pytest.FixtureRequest,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.ERROR, logger="psrp._async")
+
+    async def failure_callback(value: t.Any) -> None:
+        raise Exception("unknown failure")
+
+    connection = request.getfixturevalue(f"psrp_async_{conn}")
+    async with psrp.AsyncRunspacePool(connection) as rp:
+        ps = psrp.AsyncPowerShell(rp)
+        ps.add_script('$VerbosePreference = "Continue"; Write-Verbose -Message verbose')
+        ps.stream_verbose.data_adding += failure_callback
+        ps.stream_verbose.data_added += failure_callback
+        ps.stream_verbose.on_completed += failure_callback
+
+        await ps.invoke()
+
+        assert len(caplog.records) == 2
+
+        assert caplog.records[0].levelname == "ERROR"
+        assert caplog.records[0].message == "Failed to invoke callback for PSDataCollection data_adding"
+        assert isinstance(caplog.records[0].exc_info, tuple)
+        assert isinstance(caplog.records[0].exc_info[1], Exception)
+        assert str(caplog.records[0].exc_info[1]) == "unknown failure"
+
+        assert caplog.records[1].levelname == "ERROR"
+        assert caplog.records[1].message == "Failed to invoke callback for PSDataCollection data_added"
+        assert isinstance(caplog.records[1].exc_info, tuple)
+        assert isinstance(caplog.records[1].exc_info[1], Exception)
+        assert str(caplog.records[1].exc_info[1]) == "unknown failure"
+
+        await ps.stream_verbose.complete()
+
+        assert len(caplog.records) == 3
+
+        assert caplog.records[2].levelname == "ERROR"
+        assert caplog.records[2].message == "Failed to invoke callback for PSDataCollection on_completed"
+        assert isinstance(caplog.records[2].exc_info, tuple)
+        assert isinstance(caplog.records[2].exc_info[1], Exception)
+        assert str(caplog.records[2].exc_info[1]) == "unknown failure"
 
 
 @pytest.mark.parametrize("conn", ["proc", "ssh", "wsman"])

@@ -23,6 +23,7 @@ class WSManFaultCode(enum.IntEnum):
 
     OPERATION_ABORTED = 0x000003E3
     OPERATION_TIMED_OUT = 0x80338029
+    UNEXPECTED_SELECTORS = 0x8033805B
     SERVICE_STREAM_DISCONNECTED = 0x803381DE
     UNKNOWN = 0x8033FFFF
 
@@ -109,6 +110,14 @@ class OperationAborted(WSManFault):
     # Not a WSMan NtStatus code but is returned on an active Receive request when the shell is closed.
     CODE = WSManFaultCode.OPERATION_ABORTED
     MESSAGE = "The I/O operation has been aborted because of either a thread exit or an application request."
+
+
+class UnexpectedSelectors(WSManFault):
+    CODE = WSManFaultCode.UNEXPECTED_SELECTORS
+    MESSAGE = (
+        "The WS-Management service cannot process the request because the request contained invalid selectors "
+        "for the resource."
+    )
 
 
 class OperationTimedOut(WSManFault):

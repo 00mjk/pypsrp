@@ -2,8 +2,10 @@
 # Copyright: (c) 2022, Jordan Borean (@jborean93) <jborean93@gmail.com>
 # MIT License (see LICENSE or https://opensource.org/licenses/MIT)
 
+import asyncio
 import base64
 import dataclasses
+import functools
 import ipaddress
 import logging
 import re
@@ -454,7 +456,11 @@ class AsyncWSManTransport(httpx.AsyncBaseTransport):
         headers = request.headers.copy()
         stream: t.Union[bytes, httpx.AsyncByteStream, httpx.SyncByteStream] = request.stream
         ext = request.extensions.copy()
-        ext["trace"] = self.trace
+        if "trace" in ext:
+            trace_func = functools.partial(self.trace, trace=ext["trace"])
+            ext["trace"] = trace_func
+        else:
+            ext["trace"] = self.trace
 
         if self._encrypt:
             headers["Content-Length"] = "0"
@@ -501,11 +507,15 @@ class AsyncWSManTransport(httpx.AsyncBaseTransport):
         self,
         event_name: str,
         info: t.Dict[str, t.Any],
+        trace: t.Optional[t.Callable[[str, t.Dict[str, t.Any]], t.Awaitable[None]]] = None,
     ) -> None:
         normalized_name = event_name.lower().replace(".", "_")
         event_handler = getattr(self, f"_{normalized_name}", None)
         if event_handler:
             await event_handler(info)
+
+        if trace:
+            await trace(event_name, info)
 
     async def _http11_send_request_headers_started(self, info: t.Dict[str, t.Any]) -> None:
         # The first request needs the context to be set up and the first token added as a header
@@ -689,6 +699,7 @@ class AsyncWSManConnection:
             auth=auth_handler,
             verify=connection_info.ssl,
         )
+        self._conn_lock = asyncio.Lock()
 
     async def __aenter__(self) -> "AsyncWSManConnection":
         await self.open()
@@ -704,6 +715,7 @@ class AsyncWSManConnection:
     async def post(
         self,
         data: bytes,
+        data_sent: t.Optional[asyncio.Event] = None,
     ) -> bytes:
         """POST WSMan data to the endpoint.
 
@@ -716,13 +728,24 @@ class AsyncWSManConnection:
         Returns:
             bytes: The WSMan response.
         """
-        response = await self._http.post(
-            self.connection_uri,
-            content=data,
-            headers={
-                "Content-Type": "application/soap+xml;charset=UTF-8",
-            },
-        )
+        ext: t.Optional[t.Dict[str, t.Any]] = None
+        if data_sent:
+
+            async def trace(event_name: str, info: t.Dict[str, t.Any]) -> None:
+                if event_name == "http11.send_request_body.complete" and data_sent:
+                    data_sent.set()
+
+            ext = {"trace": trace}
+
+        async with self._conn_lock:
+            response = await self._http.post(
+                self.connection_uri,
+                content=data,
+                headers={
+                    "Content-Type": "application/soap+xml;charset=UTF-8",
+                },
+                extensions=ext,
+            )
 
         content = await response.aread()
 

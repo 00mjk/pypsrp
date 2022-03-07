@@ -24,6 +24,7 @@ from psrp._exceptions import (
     OperationAborted,
     OperationTimedOut,
     ServiceStreamDisconnected,
+    UnexpectedSelectors,
 )
 from psrp._io.wsman import AsyncWSManConnection, WSManConnection, WSManConnectionData
 from psrp._winrs import WinRS, enumerate_winrs, receive_winrs_enumeration
@@ -534,6 +535,8 @@ class AsyncWSManInfo(AsyncConnectionInfo):
 
         shells = receive_winrs_enumeration(wsman, shell_enumeration)[0]
         for shell in shells:
+            # FIXME: shell.state must be "Disconnected", figure out a way to
+            # expose this data publicly for get_runspace_pools
             enumerate_winrs(
                 wsman,
                 resource_uri="http://schemas.microsoft.com/wbem/wsman/1/windows/shell/Command",
@@ -568,10 +571,8 @@ class AsyncWSManInfo(AsyncConnectionInfo):
 
         async with AsyncWSManConnection(self._connection_info) as conn:
             while True:
-                started.set()
-
                 winrs.receive("stdout", command_id=pipeline_id)
-                resp = await conn.post(winrs.data_to_send())
+                resp = await conn.post(winrs.data_to_send(), data_sent=None if started.is_set() else started)
 
                 try:
                     event = t.cast(ReceiveResponseEvent, winrs.receive_data(resp))
@@ -580,7 +581,7 @@ class AsyncWSManInfo(AsyncConnectionInfo):
                     # Occurs when there has been no output after the OperationTimeout set, just repeat the request
                     continue
 
-                except (OperationAborted, ServiceStreamDisconnected):
+                except (OperationAborted, UnexpectedSelectors, ServiceStreamDisconnected):
                     # Received when the shell or pipeline has been closed
                     break
 
