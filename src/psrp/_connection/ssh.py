@@ -7,10 +7,39 @@ import logging
 import typing as t
 
 import asyncssh
+from psrpcore import ClientRunspacePool
 
-from psrp._connection.out_of_proc import AsyncOutOfProcInfo
+from psrp._connection.connection import AsyncEventCallable, ConnectionInfo
+from psrp._connection.out_of_proc import AsyncOutOfProcConnection
 
 log = logging.getLogger(__name__)
+
+
+class SSHInfo(ConnectionInfo):
+    def __init__(
+        self,
+        hostname: str,
+        port: int = 22,
+        username: t.Optional[str] = None,
+        password: t.Optional[str] = None,
+        subsystem: str = "powershell",
+        executable: t.Optional[str] = None,
+        arguments: t.Optional[t.List[str]] = None,
+    ) -> None:
+        self.hostname = hostname
+        self.port = port
+        self.username = username
+        self.password = password
+        self.subsystem = subsystem
+        self.executable = executable
+        self.arguments = arguments or []
+
+    async def create_async(
+        self,
+        pool: ClientRunspacePool,
+        callback: AsyncEventCallable,
+    ) -> "AsyncSSHInfo":
+        return AsyncSSHInfo(pool, callback, self)
 
 
 class _ClientSession(asyncssh.SSHClientSession):
@@ -26,27 +55,16 @@ class _ClientSession(asyncssh.SSHClientSession):
         self.incoming.put_nowait(data)
 
 
-class AsyncSSHInfo(AsyncOutOfProcInfo):
+class AsyncSSHInfo(AsyncOutOfProcConnection):
     def __init__(
         self,
-        hostname: str,
-        port: int = 22,
-        username: t.Optional[str] = None,
-        password: t.Optional[str] = None,
-        subsystem: str = "powershell",
-        executable: t.Optional[str] = None,
-        arguments: t.Optional[t.List[str]] = None,
+        pool: ClientRunspacePool,
+        callback: AsyncEventCallable,
+        info: SSHInfo,
     ) -> None:
-        super().__init__()
+        super().__init__(pool, callback)
 
-        self._hostname = hostname
-        self._port = port
-        self._username = username
-        self._password = password
-        self._subsystem = subsystem
-        self._executable = executable
-        self._arguments = arguments or []
-
+        self._info = info
         self._ssh: t.Optional[asyncssh.SSHClientConnection] = None
         self._channel: t.Optional[asyncssh.SSHClientChannel] = None
         self._session: t.Optional[_ClientSession] = None
@@ -69,22 +87,22 @@ class AsyncSSHInfo(AsyncOutOfProcInfo):
     async def start(self) -> None:
         conn_options = asyncssh.SSHClientConnectionOptions(
             known_hosts=None,
-            username=self._username,
-            password=self._password,
+            username=self._info.username,
+            password=self._info.password,
         )
         self._ssh = await asyncssh.connect(
-            self._hostname,
-            port=self._port,
+            self._info.hostname,
+            port=self._info.port,
             options=conn_options,
         )
 
         cmd: t.Union[str, t.Tuple[()]] = ()
-        if self._executable:
-            cmd = " ".join([self._executable] + self._arguments)
+        if self._info.executable:
+            cmd = " ".join([self._info.executable] + self._info.arguments)
             subsystem = None
 
         else:
-            subsystem = self._subsystem
+            subsystem = self._info.subsystem
 
         self._channel, self._session = await self._ssh.create_session(  # type: ignore[assignment]
             _ClientSession,

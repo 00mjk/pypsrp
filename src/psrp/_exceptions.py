@@ -136,3 +136,7 @@ class PipelineFailed(PSRPError):
 
 class PipelineStopped(PSRPError):
     """A pipeline was stopped."""
+
+
+class RunspaceNotAvailable(PSRPError):
+    """A runspace pool is not available for use, most likely connected to another client."""

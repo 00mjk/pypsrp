@@ -28,7 +28,7 @@ class PSDataCallbacks:
 
 @pytest.mark.parametrize("conn", ["proc", "ssh", "wsman"])
 async def test_open_runspace(conn: str, request: pytest.FixtureRequest) -> None:
-    connection = request.getfixturevalue(f"psrp_async_{conn}")
+    connection = request.getfixturevalue(f"psrp_{conn}")
     async with psrp.AsyncRunspacePool(connection) as rp:
         assert rp.state == psrpcore.types.RunspacePoolState.Opened
         assert rp.max_runspaces == 1
@@ -41,7 +41,7 @@ async def test_open_runspace(conn: str, request: pytest.FixtureRequest) -> None:
 
 @pytest.mark.parametrize("conn", ["proc", "ssh", "wsman"])
 async def test_open_runspace_min_max(conn: str, request: pytest.FixtureRequest) -> None:
-    connection = request.getfixturevalue(f"psrp_async_{conn}")
+    connection = request.getfixturevalue(f"psrp_{conn}")
     async with psrp.AsyncRunspacePool(connection, min_runspaces=2, max_runspaces=3) as rp:
         assert rp.state == psrpcore.types.RunspacePoolState.Opened
         assert rp.max_runspaces == 3
@@ -50,7 +50,7 @@ async def test_open_runspace_min_max(conn: str, request: pytest.FixtureRequest) 
 
 @pytest.mark.parametrize("conn", ["proc", "ssh", "wsman"])
 async def test_open_runspace_invalid_min_max(conn: str, request: pytest.FixtureRequest) -> None:
-    connection = request.getfixturevalue(f"psrp_async_{conn}")
+    connection = request.getfixturevalue(f"psrp_{conn}")
 
     with pytest.raises(
         ValueError, match="min_runspaces must be greater than 0 and max_runspaces must be greater than min_runspaces"
@@ -61,7 +61,7 @@ async def test_open_runspace_invalid_min_max(conn: str, request: pytest.FixtureR
 
 @pytest.mark.parametrize("conn", ["proc", "ssh", "wsman"])
 async def test_runspace_set_min_max(conn: str, request: pytest.FixtureRequest) -> None:
-    connection = request.getfixturevalue(f"psrp_async_{conn}")
+    connection = request.getfixturevalue(f"psrp_{conn}")
     async with psrp.AsyncRunspacePool(connection) as rp:
         assert rp.min_runspaces == 1
         assert rp.max_runspaces == 1
@@ -97,31 +97,59 @@ async def test_runspace_set_min_max(conn: str, request: pytest.FixtureRequest) -
         assert actual
 
 
-async def test_runspace_disconnect(psrp_async_wsman: psrp.AsyncWSManInfo) -> None:
-    async with psrp.AsyncRunspacePool(psrp_async_wsman) as rp:
+async def test_runspace_disconnect(psrp_wsman: psrp.ConnectionInfo) -> None:
+    async with psrp.AsyncRunspacePool(psrp_wsman) as rp:
         assert rp.state == psrpcore.types.RunspacePoolState.Opened
         await rp.disconnect()
         assert rp.state == psrpcore.types.RunspacePoolState.Disconnected
 
     assert rp.state == psrpcore.types.RunspacePoolState.Disconnected
 
+    # Reconnect back as the same client
     async with rp:
         assert rp.state == psrpcore.types.RunspacePoolState.Opened
+        await rp.reset_runspace_state()
         await rp.disconnect()
 
     assert rp.state == psrpcore.types.RunspacePoolState.Disconnected
 
-    async for rp in psrp.AsyncRunspacePool.get_runspace_pools(psrp_async_wsman):
+    # Connect back as a new client
+    async for rp in psrp.AsyncRunspacePool.get_runspace_pools(psrp_wsman):
         assert rp.state == psrpcore.types.RunspacePoolState.Disconnected
 
         async with rp:
             assert rp.state == psrpcore.types.RunspacePoolState.Opened
+            await rp.reset_runspace_state()
 
         assert rp.state == psrpcore.types.RunspacePoolState.Closed
 
 
-async def test_runspace_disconnect_unsupported(psrp_async_proc: psrp.AsyncProcessInfo) -> None:
-    async with psrp.AsyncRunspacePool(psrp_async_proc) as rp:
+async def test_runspace_not_available(psrp_wsman: psrp.ConnectionInfo) -> None:
+    async with psrp.AsyncRunspacePool(psrp_wsman) as rp:
+        async for runspace in psrp.AsyncRunspacePool.get_runspace_pools(psrp_wsman):
+            if runspace._pool.runspace_pool_id != rp._pool.runspace_pool_id:
+                continue
+
+            assert not runspace.is_available
+            assert runspace.state == psrpcore.types.RunspacePoolState.Opened
+
+            expected = "This Runspace Pool is connected to another client"
+            with pytest.raises(psrp.RunspaceNotAvailable, match=expected):
+                async with runspace:
+                    pass
+
+            with pytest.raises(psrp.RunspaceNotAvailable, match=expected):
+                await runspace.open()
+
+            with pytest.raises(psrp.RunspaceNotAvailable, match=expected):
+                await runspace.connect()
+
+            with pytest.raises(psrp.RunspaceNotAvailable, match=expected):
+                await runspace.reset_runspace_state()
+
+
+async def test_runspace_disconnect_unsupported(psrp_proc: psrp.ConnectionInfo) -> None:
+    async with psrp.AsyncRunspacePool(psrp_proc) as rp:
         with pytest.raises(
             NotImplementedError, match="Disconnection operation not implemented on this connection type"
         ):
@@ -134,7 +162,7 @@ async def test_runspace_application_arguments(conn: str, request: pytest.Fixture
         "test_var": "abcdef12345",
         "bool": True,
     }
-    connection = request.getfixturevalue(f"psrp_async_{conn}")
+    connection = request.getfixturevalue(f"psrp_{conn}")
     async with psrp.AsyncRunspacePool(connection, application_arguments=app_args) as rp:
         ps = psrp.AsyncPowerShell(rp)
         ps.add_script("$PSSenderInfo.ApplicationArguments")
@@ -147,7 +175,7 @@ async def test_runspace_application_arguments(conn: str, request: pytest.Fixture
 
 @pytest.mark.parametrize("conn", ["proc", "ssh", "wsman"])
 async def test_runspace_reset_state(conn: str, request: pytest.FixtureRequest) -> None:
-    connection = request.getfixturevalue(f"psrp_async_{conn}")
+    connection = request.getfixturevalue(f"psrp_{conn}")
     async with psrp.AsyncRunspacePool(connection) as rp:
         ps = psrp.AsyncPowerShell(rp)
         ps.add_script("$global:TestVar = 'foo'")
@@ -189,7 +217,7 @@ async def test_runspace_host_call(
     monkeypatch.setattr(ps_host.ui, "read_line", lambda: "pipeline line")
     monkeypatch.setattr(ps_host.ui, "write_line2", ps_write_line)
 
-    connection = request.getfixturevalue(f"psrp_async_{conn}")
+    connection = request.getfixturevalue(f"psrp_{conn}")
     async with psrp.AsyncRunspacePool(connection, host=rp_host) as rp:
         ps = psrp.AsyncPowerShell(rp, host=ps_host)
         ps.add_script(
@@ -223,7 +251,7 @@ async def test_runspace_host_call_failure(
 
     monkeypatch.setattr(rp_host.ui, "write_line2", write_line)
 
-    connection = request.getfixturevalue(f"psrp_async_{conn}")
+    connection = request.getfixturevalue(f"psrp_{conn}")
     async with psrp.AsyncRunspacePool(connection, host=rp_host) as rp:
         ps = psrp.AsyncPowerShell(rp)
         ps.add_script(
@@ -247,7 +275,7 @@ async def test_runspace_host_call_failure(
 @pytest.mark.parametrize("conn", ["proc", "ssh", "wsman"])
 async def test_runspace_user_event(conn: str, request: pytest.FixtureRequest) -> None:
     callback = PSEventCallbacks()
-    connection = request.getfixturevalue(f"psrp_async_{conn}")
+    connection = request.getfixturevalue(f"psrp_{conn}")
     async with psrp.AsyncRunspacePool(connection) as rp:
         rp.user_event += callback
 
@@ -304,7 +332,7 @@ async def test_runspace_powershell_event_exception(
     async def failure_callback(event: psrpcore.PSRPEvent) -> None:
         raise Exception("unknown failure")
 
-    connection = request.getfixturevalue(f"psrp_async_{conn}")
+    connection = request.getfixturevalue(f"psrp_{conn}")
     rp = psrp.AsyncRunspacePool(connection)
     rp.user_event += failure_callback
     rp.state_changed += failure_callback
@@ -359,7 +387,7 @@ async def test_runspace_powershell_event_exception(
 async def test_runspace_stream_data(conn: str, request: pytest.FixtureRequest) -> None:
     # This is not a scenario that is valid in a normal pwsh endpoint but I've seen it before with custom PSRemoting
     # endpoints (Exchange Online).
-    connection = request.getfixturevalue(f"psrp_async_{conn}")
+    connection = request.getfixturevalue(f"psrp_{conn}")
     async with psrp.AsyncRunspacePool(connection) as rp:
         server = psrpcore.ServerRunspacePool()
         server.runspace_pool_id = rp._pool.runspace_pool_id
@@ -378,7 +406,8 @@ async def test_runspace_stream_data(conn: str, request: pytest.FixtureRequest) -
             msg = server.data_to_send()
             if not msg:
                 break
-            await connection.process_response(rp._pool, msg)
+            assert rp._connection is not None
+            await rp._connection.process_response(msg)
 
         assert len(rp.stream_debug) == 1
         assert isinstance(rp.stream_debug[0], psrpcore.types.DebugRecord)
@@ -407,7 +436,7 @@ async def test_runspace_stream_data(conn: str, request: pytest.FixtureRequest) -
 
 @pytest.mark.parametrize("conn", ["proc", "ssh", "wsman"])
 async def test_run_powershell(conn: str, request: pytest.FixtureRequest) -> None:
-    connection = request.getfixturevalue(f"psrp_async_{conn}")
+    connection = request.getfixturevalue(f"psrp_{conn}")
     async with psrp.AsyncRunspacePool(connection) as rp:
         ps = psrp.AsyncPowerShell(rp)
         ps.add_script("echo 'hi'")
@@ -417,7 +446,7 @@ async def test_run_powershell(conn: str, request: pytest.FixtureRequest) -> None
 
 @pytest.mark.parametrize("conn", ["proc", "ssh", "wsman"])
 async def test_powershell_secure_string(conn: str, request: pytest.FixtureRequest) -> None:
-    connection = request.getfixturevalue(f"psrp_async_{conn}")
+    connection = request.getfixturevalue(f"psrp_{conn}")
     async with psrp.AsyncRunspacePool(connection) as rp:
         ps = psrp.AsyncPowerShell(rp)
 
@@ -431,7 +460,7 @@ async def test_powershell_secure_string(conn: str, request: pytest.FixtureReques
 
 @pytest.mark.parametrize("conn", ["proc", "ssh", "wsman"])
 async def test_powershell_receive_secure_string(conn: str, request: pytest.FixtureRequest) -> None:
-    connection = request.getfixturevalue(f"psrp_async_{conn}")
+    connection = request.getfixturevalue(f"psrp_{conn}")
     async with psrp.AsyncRunspacePool(connection) as rp:
         ps = psrp.AsyncPowerShell(rp)
 
@@ -451,7 +480,7 @@ async def test_powershell_receive_secure_string(conn: str, request: pytest.Fixtu
 
 @pytest.mark.parametrize("conn", ["proc", "ssh", "wsman"])
 async def test_powershell_streams(conn: str, request: pytest.FixtureRequest) -> None:
-    connection = request.getfixturevalue(f"psrp_async_{conn}")
+    connection = request.getfixturevalue(f"psrp_{conn}")
     async with psrp.AsyncRunspacePool(connection) as rp:
         ps = psrp.AsyncPowerShell(rp)
 
@@ -486,7 +515,7 @@ async def test_powershell_streams(conn: str, request: pytest.FixtureRequest) -> 
         assert ps.stream_information[0].MessageData == "information"
 
         # WSMan always adds another progress record, remove to align the tests
-        if isinstance(connection, psrp.AsyncWSManInfo):
+        if isinstance(connection, psrp.WSManInfo):
             ps.stream_progress.pop(0)
         assert len(ps.stream_progress) == 1
         assert ps.stream_progress[0].Activity == "progress"
@@ -502,7 +531,7 @@ async def test_powershell_streams(conn: str, request: pytest.FixtureRequest) -> 
 
 @pytest.mark.parametrize("conn", ["proc", "ssh", "wsman"])
 async def test_powershell_invalid_command(conn: str, request: pytest.FixtureRequest) -> None:
-    connection = request.getfixturevalue(f"psrp_async_{conn}")
+    connection = request.getfixturevalue(f"psrp_{conn}")
     async with psrp.AsyncRunspacePool(connection) as rp:
         ps = psrp.AsyncPowerShell(rp)
         ps.add_command("Fake-Command")
@@ -518,7 +547,7 @@ async def test_powershell_invalid_command(conn: str, request: pytest.FixtureRequ
 async def test_powershell_state_changed(conn: str, request: pytest.FixtureRequest) -> None:
     callbacks = PSEventCallbacks()
 
-    connection = request.getfixturevalue(f"psrp_async_{conn}")
+    connection = request.getfixturevalue(f"psrp_{conn}")
     async with psrp.AsyncRunspacePool(connection) as rp:
         ps = psrp.AsyncPowerShell(rp)
         ps.state_changed += callbacks
@@ -538,7 +567,7 @@ async def test_powershell_state_changed(conn: str, request: pytest.FixtureReques
 @pytest.mark.parametrize("conn", ["proc", "ssh", "wsman"])
 async def test_powershell_stream_events(conn: str, request: pytest.FixtureRequest) -> None:
     callbacks = PSDataCallbacks()
-    connection = request.getfixturevalue(f"psrp_async_{conn}")
+    connection = request.getfixturevalue(f"psrp_{conn}")
     async with psrp.AsyncRunspacePool(connection) as rp:
         ps = psrp.AsyncPowerShell(rp)
         ps.add_script('$VerbosePreference = "Continue"; Write-Verbose -Message verbose')
@@ -586,7 +615,7 @@ async def test_powershell_stream_events_exception(
     async def failure_callback(value: t.Any) -> None:
         raise Exception("unknown failure")
 
-    connection = request.getfixturevalue(f"psrp_async_{conn}")
+    connection = request.getfixturevalue(f"psrp_{conn}")
     async with psrp.AsyncRunspacePool(connection) as rp:
         ps = psrp.AsyncPowerShell(rp)
         ps.add_script('$VerbosePreference = "Continue"; Write-Verbose -Message verbose')
@@ -645,7 +674,7 @@ async def test_powershell_blocking_iterator(conn: str, request: pytest.FixtureRe
     $ps2.EndInvoke($t2)
     $ps.EndInvoke($t2)
     """
-    connection = request.getfixturevalue(f"psrp_async_{conn}")
+    connection = request.getfixturevalue(f"psrp_{conn}")
     async with psrp.AsyncRunspacePool(connection) as rp:
         ps = psrp.AsyncPowerShell(rp)
 
@@ -689,7 +718,7 @@ async def test_powershell_host_call(
     monkeypatch.setattr(ps_host.ui, "read_line", lambda: "pipeline line")
     monkeypatch.setattr(ps_host.ui, "write_line2", ps_write_line)
 
-    connection = request.getfixturevalue(f"psrp_async_{conn}")
+    connection = request.getfixturevalue(f"psrp_{conn}")
     async with psrp.AsyncRunspacePool(connection, host=rp_host) as rp:
         ps = psrp.AsyncPowerShell(rp, host=ps_host)
         ps.add_script(
@@ -708,7 +737,7 @@ async def test_powershell_host_call(
 async def test_powershell_host_call_failure(conn: str, request: pytest.FixtureRequest) -> None:
     ps_host = psrp.PSHost(ui=psrp.PSHostUI())
 
-    connection = request.getfixturevalue(f"psrp_async_{conn}")
+    connection = request.getfixturevalue(f"psrp_{conn}")
     async with psrp.AsyncRunspacePool(connection) as rp:
         ps = psrp.AsyncPowerShell(rp, host=ps_host)
         ps.add_script(
@@ -737,7 +766,7 @@ async def test_powershell_host_call_async(
     ps_host = psrp.PSHost(ui=psrp.PSHostUI())
     monkeypatch.setattr(ps_host.ui, "read_line", read_line)
 
-    connection = request.getfixturevalue(f"psrp_async_{conn}")
+    connection = request.getfixturevalue(f"psrp_{conn}")
     async with psrp.AsyncRunspacePool(connection) as rp:
         ps = psrp.AsyncPowerShell(rp, host=ps_host)
         ps.add_script("$Host.UI.ReadLine()")
@@ -748,7 +777,7 @@ async def test_powershell_host_call_async(
 
 @pytest.mark.parametrize("conn", ["proc", "ssh", "wsman"])
 async def test_powershell_complex_commands(conn: str, request: pytest.FixtureRequest) -> None:
-    connection = request.getfixturevalue(f"psrp_async_{conn}")
+    connection = request.getfixturevalue(f"psrp_{conn}")
     async with psrp.AsyncRunspacePool(connection) as rp:
         ps = psrp.AsyncPowerShell(rp)
         ps.add_command("Set-Variable").add_parameters(Name="string", Value="foo")
@@ -771,7 +800,7 @@ async def test_powershell_complex_commands(conn: str, request: pytest.FixtureReq
 
 @pytest.mark.parametrize("conn", ["proc", "ssh", "wsman"])
 async def test_powershell_input_as_iterable(conn: str, request: pytest.FixtureRequest) -> None:
-    connection = request.getfixturevalue(f"psrp_async_{conn}")
+    connection = request.getfixturevalue(f"psrp_{conn}")
     async with psrp.AsyncRunspacePool(connection) as rp:
         ps = psrp.AsyncPowerShell(rp)
         ps.add_script("begin { $i = 0 }; process { [PSCustomObject]@{Idx = $i; Value = $_}; $i++ }")
@@ -795,7 +824,7 @@ async def test_powershell_input_as_async_iterable(conn: str, request: pytest.Fix
         yield 2
         yield 3
 
-    connection = request.getfixturevalue(f"psrp_async_{conn}")
+    connection = request.getfixturevalue(f"psrp_{conn}")
     async with psrp.AsyncRunspacePool(connection) as rp:
         ps = psrp.AsyncPowerShell(rp)
         ps.add_script("begin { $i = 0 }; process { [PSCustomObject]@{Idx = $i; Value = $_}; $i++ }")
@@ -813,7 +842,7 @@ async def test_powershell_input_as_async_iterable(conn: str, request: pytest.Fix
 
 @pytest.mark.parametrize("conn", ["proc", "ssh", "wsman"])
 async def test_powershell_input_with_secure_string(conn: str, request: pytest.FixtureRequest) -> None:
-    connection = request.getfixturevalue(f"psrp_async_{conn}")
+    connection = request.getfixturevalue(f"psrp_{conn}")
     async with psrp.AsyncRunspacePool(connection) as rp:
         ps = psrp.AsyncPowerShell(rp)
         ps.add_script("begin { $i = 0 }; process { [PSCustomObject]@{Idx = $i; Value = $_}; $i++ }")
@@ -828,7 +857,7 @@ async def test_powershell_input_with_secure_string(conn: str, request: pytest.Fi
 
 @pytest.mark.parametrize("conn", ["proc", "ssh", "wsman"])
 async def test_powershell_unbuffered_input(conn: str, request: pytest.FixtureRequest) -> None:
-    connection = request.getfixturevalue(f"psrp_async_{conn}")
+    connection = request.getfixturevalue(f"psrp_{conn}")
     async with psrp.AsyncRunspacePool(connection) as rp:
         ps = psrp.AsyncPowerShell(rp)
         ps.add_script("begin { $i = 0 }; process { [PSCustomObject]@{Idx = $i; Value = $_}; $i++ }")
@@ -846,7 +875,7 @@ async def test_powershell_unbuffered_input(conn: str, request: pytest.FixtureReq
 
 @pytest.mark.parametrize("conn", ["proc", "ssh", "wsman"])
 async def test_powershell_invoke_async(conn: str, request: pytest.FixtureRequest) -> None:
-    connection = request.getfixturevalue(f"psrp_async_{conn}")
+    connection = request.getfixturevalue(f"psrp_{conn}")
     async with psrp.AsyncRunspacePool(connection) as rp:
         ps = psrp.AsyncPowerShell(rp)
         ps.add_script("1; Start-Sleep -Seconds 1; 2")
@@ -860,7 +889,7 @@ async def test_powershell_invoke_async(conn: str, request: pytest.FixtureRequest
 
 @pytest.mark.parametrize("conn", ["proc", "ssh", "wsman"])
 async def test_powershell_invoke_async_on_complete(conn: str, request: pytest.FixtureRequest) -> None:
-    connection = request.getfixturevalue(f"psrp_async_{conn}")
+    connection = request.getfixturevalue(f"psrp_{conn}")
     async with psrp.AsyncRunspacePool(connection) as rp:
         ps = psrp.AsyncPowerShell(rp)
         ps.add_script("1; Start-Sleep -Seconds 1; 2")
@@ -879,7 +908,7 @@ async def test_powershell_invoke_async_on_complete(conn: str, request: pytest.Fi
 
 @pytest.mark.parametrize("conn", ["proc", "ssh", "wsman"])
 async def test_powershell_stop(conn: str, request: pytest.FixtureRequest) -> None:
-    connection = request.getfixturevalue(f"psrp_async_{conn}")
+    connection = request.getfixturevalue(f"psrp_{conn}")
     async with psrp.AsyncRunspacePool(connection) as rp:
         ps = psrp.AsyncPowerShell(rp)
         ps.add_script("1; Start-Sleep -Seconds 60; 2")
@@ -912,7 +941,7 @@ async def test_powershell_stop(conn: str, request: pytest.FixtureRequest) -> Non
 
 @pytest.mark.parametrize("conn", ["proc", "ssh", "wsman"])
 async def test_powershell_stop_async(conn: str, request: pytest.FixtureRequest) -> None:
-    connection = request.getfixturevalue(f"psrp_async_{conn}")
+    connection = request.getfixturevalue(f"psrp_{conn}")
     async with psrp.AsyncRunspacePool(connection) as rp:
         ps = psrp.AsyncPowerShell(rp)
 
@@ -940,7 +969,7 @@ async def test_powershell_stop_async(conn: str, request: pytest.FixtureRequest) 
 
 @pytest.mark.parametrize("conn", ["proc", "ssh", "wsman"])
 async def test_powershell_stop_async_on_completed(conn: str, request: pytest.FixtureRequest) -> None:
-    connection = request.getfixturevalue(f"psrp_async_{conn}")
+    connection = request.getfixturevalue(f"psrp_{conn}")
     async with psrp.AsyncRunspacePool(connection) as rp:
         ps = psrp.AsyncPowerShell(rp)
 
@@ -972,19 +1001,37 @@ async def test_powershell_stop_async_on_completed(conn: str, request: pytest.Fix
         assert out == [1]
 
 
-@pytest.mark.skip
-async def test_powershell_connect(psrp_async_wsman: psrp.AsyncWSManInfo) -> None:
-    raise NotImplementedError()
+async def test_powershell_connect(psrp_wsman: psrp.ConnectionInfo) -> None:
+    rp: t.Optional[psrp.AsyncRunspacePool]
+    async with psrp.AsyncRunspacePool(psrp_wsman) as rp:
+        ps = psrp.AsyncPowerShell(rp)
+        ps.add_script("1; Start-Sleep -Seconds 60; 2")
+        await ps.invoke_async()
+        await rp.disconnect()
+
+    rpid = rp._pool.runspace_pool_id
+    rp = None
+    async for disconnected_rp in psrp.AsyncRunspacePool.get_runspace_pools(psrp_wsman):
+        if disconnected_rp._pool.runspace_pool_id == rpid:
+            rp = disconnected_rp
+            break
+
+    assert rp is not None
+    async with rp:
+        assert rp.state == psrpcore.types.RunspacePoolState.Opened
+        # FIXME: Test out getting pipeline
+
+    assert rp.state == psrpcore.types.RunspacePoolState.Closed
 
 
 @pytest.mark.skip
-async def test_powershell_connect_async(psrp_async_wsman: psrp.AsyncWSManInfo) -> None:
+async def test_powershell_connect_async(psrp_wsman: psrp.ConnectionInfo) -> None:
     raise NotImplementedError()
 
 
 @pytest.mark.parametrize("conn", ["proc", "ssh", "wsman"])
 async def test_run_get_command_meta(conn: str, request: pytest.FixtureRequest) -> None:
-    connection = request.getfixturevalue(f"psrp_async_{conn}")
+    connection = request.getfixturevalue(f"psrp_{conn}")
     async with psrp.AsyncRunspacePool(connection) as rp:
         gcm = psrp.AsyncCommandMetaPipeline(
             rp,

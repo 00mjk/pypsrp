@@ -672,7 +672,7 @@ class AsyncWSManTransport(httpx.AsyncBaseTransport):
             )
 
 
-class AsyncWSManConnection:
+class AsyncWSManHTTP:
     def __init__(
         self,
         connection_info: WSManConnectionData,
@@ -701,7 +701,7 @@ class AsyncWSManConnection:
         )
         self._conn_lock = asyncio.Lock()
 
-    async def __aenter__(self) -> "AsyncWSManConnection":
+    async def __aenter__(self) -> "AsyncWSManHTTP":
         await self.open()
         return self
 
@@ -771,7 +771,7 @@ class AsyncWSManConnection:
         await self._http.aclose()
 
 
-class WSManConnection:
+class WSManHTTP:
     def __init__(
         self,
         connection_info: WSManConnectionData,
@@ -799,7 +799,7 @@ class WSManConnection:
             verify=connection_info.ssl,
         )
 
-    def __enter__(self) -> "WSManConnection":
+    def __enter__(self) -> "WSManHTTP":
         self.open()
         return self
 

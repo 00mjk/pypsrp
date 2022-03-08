@@ -7,12 +7,38 @@ import logging
 import subprocess
 import typing as t
 
-from psrp._connection.out_of_proc import AsyncOutOfProcInfo, OutOfProcInfo
+from psrpcore import ClientRunspacePool
+
+from psrp._connection.connection import (
+    AsyncEventCallable,
+    ConnectionInfo,
+    SyncEventCallable,
+)
+from psrp._connection.out_of_proc import AsyncOutOfProcConnection, OutOfProcConnection
 
 log = logging.getLogger(__name__)
 
 
-class ProcessInfo(OutOfProcInfo):
+class ProcessInfo(ConnectionInfo):
+    def __init__(
+        self,
+        executable: str = "pwsh",
+        arguments: t.Optional[t.List[str]] = None,
+    ) -> None:
+        self.executable = executable
+        self.arguments = arguments or []
+        if arguments is None:
+            self.arguments = ["-NoProfile", "-NoLogo", "-s"]
+
+    async def create_async(
+        self,
+        pool: ClientRunspacePool,
+        callback: AsyncEventCallable,
+    ) -> "AsyncProcessConnection":
+        return AsyncProcessConnection(pool, callback, self)
+
+
+class ProcessConnection(OutOfProcConnection):
     """ConnectionInfo for a Process.
 
     ConnectionInfo implementation for a native process. The data is read from
@@ -29,15 +55,12 @@ class ProcessInfo(OutOfProcInfo):
 
     def __init__(
         self,
-        executable: str = "pwsh",
-        arguments: t.Optional[t.List[str]] = None,
+        pool: ClientRunspacePool,
+        callback: SyncEventCallable,
+        info: ProcessInfo,
     ) -> None:
-        super().__init__()
-
-        self.executable = executable
-        self.arguments = arguments or []
-        if arguments is None:
-            self.arguments = ["-NoProfile", "-NoLogo", "-s"]
+        super().__init__(pool, callback)
+        self._info = info
 
         self._process: t.Optional[subprocess.Popen] = None
 
@@ -45,7 +68,7 @@ class ProcessInfo(OutOfProcInfo):
         if not self._process:
             raise Exception("FIXME: Process not started")
 
-        return self._process.stdout.read(32_768) or None  # type: ignore[union-attr] # Will be set
+        return self._process.stdout.read(self.get_fragment_size()) or None  # type: ignore[union-attr] # Will be set
 
     def write(
         self,
@@ -60,8 +83,8 @@ class ProcessInfo(OutOfProcInfo):
 
     def start(self) -> None:
         pipe = subprocess.PIPE
-        arguments = [self.executable]
-        arguments.extend(self.arguments)
+        arguments = [self._info.executable]
+        arguments.extend(self._info.arguments)
 
         self._process = subprocess.Popen(arguments, stdin=pipe, stdout=pipe, stderr=subprocess.STDOUT)
 
@@ -71,7 +94,7 @@ class ProcessInfo(OutOfProcInfo):
             self._process.wait()
 
 
-class AsyncProcessInfo(AsyncOutOfProcInfo):
+class AsyncProcessConnection(AsyncOutOfProcConnection):
     """Async ConnectionInfo for a Process.
 
     Async ConnectionInfo implementation for a native process. The data is read
@@ -88,16 +111,13 @@ class AsyncProcessInfo(AsyncOutOfProcInfo):
 
     def __init__(
         self,
-        executable: str = "pwsh",
-        arguments: t.Optional[t.List[str]] = None,
+        pool: ClientRunspacePool,
+        callback: AsyncEventCallable,
+        info: ProcessInfo,
     ) -> None:
-        super().__init__()
+        super().__init__(pool, callback)
 
-        self.executable = executable
-        self.arguments = arguments or []
-        if arguments is None:
-            self.arguments = ["-NoProfile", "-NoLogo", "-s"]
-
+        self._info = info
         self._process: t.Optional[asyncio.subprocess.Process] = None
 
     async def read(self) -> t.Optional[bytes]:
@@ -120,8 +140,8 @@ class AsyncProcessInfo(AsyncOutOfProcInfo):
     async def start(self) -> None:
         pipe = subprocess.PIPE
         self._process = await asyncio.create_subprocess_exec(
-            self.executable,
-            *self.arguments,
+            self._info.executable,
+            *self._info.arguments,
             stdin=pipe,
             stdout=pipe,
             stderr=subprocess.STDOUT,

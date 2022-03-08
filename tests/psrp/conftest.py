@@ -19,15 +19,15 @@ PWSH_PATH = which("pwsh.exe" if os.name == "nt" else "pwsh")
 
 
 @pytest.fixture(scope="function")
-def psrp_async_proc() -> t.Iterator[psrp.AsyncProcessInfo]:
+def psrp_proc() -> t.Iterator[psrp.ConnectionInfo]:
     if not PWSH_PATH:
-        pytest.skip("Integration test requires pwsh")
+        pytest.skip("Process integration test requires pwsh")
 
-    yield psrp.AsyncProcessInfo(executable=PWSH_PATH)
+    yield psrp.ProcessInfo(executable=PWSH_PATH)
 
 
 @pytest.fixture(scope="function")
-def psrp_async_wsman() -> t.Iterator[psrp.AsyncWSManInfo]:
+def psrp_wsman() -> t.Iterator[psrp.ConnectionInfo]:
     server = os.environ.get("PYPSRP_SERVER", "server2019.domain.test")
     username = os.environ.get("PYPSRP_USERNAME", "vagrant-domain@DOMAIN.TEST")
     password = os.environ.get("PYPSRP_PASSWORD", "VagrantPass1")
@@ -42,13 +42,13 @@ def psrp_async_wsman() -> t.Iterator[psrp.AsyncWSManInfo]:
         port=port,
         username=username,
         password=password,
-        auth=auth,
+        auth=auth,  # type: ignore[arg-type]
         encryption="never",
     )
 
-    yield psrp.AsyncWSManInfo(conn_info)
+    yield psrp.WSManInfo(conn_info)
 
 
 @pytest.fixture(scope="function")
-def psrp_async_ssh() -> t.Iterator[psrp.AsyncOutOfProcInfo]:
+def psrp_ssh() -> t.Iterator[psrp.ConnectionInfo]:
     pytest.skip("TODO: Create SSH connection info")

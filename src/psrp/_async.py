@@ -18,7 +18,6 @@ from psrpcore import (
     ErrorRecordEvent,
     GetRunspaceAvailabilityEvent,
     InformationRecordEvent,
-    InitRunspacePoolEvent,
     MissingCipherError,
     PipelineHostCallEvent,
     PipelineOutputEvent,
@@ -52,8 +51,8 @@ from psrpcore.types import (
 )
 
 from ._compat import iscoroutinefunction
-from ._connection.connection_info import AsyncConnectionInfo
-from ._exceptions import PipelineFailed, PipelineStopped
+from ._connection.connection import AsyncConnection, ConnectionInfo
+from ._exceptions import PipelineFailed, PipelineStopped, RunspaceNotAvailable
 from ._host import PSHost, get_host_method
 
 PipelineType = t.TypeVar("PipelineType", bound=t.Union[ClientGetCommandMetadata, ClientPowerShell])
@@ -211,7 +210,7 @@ class MessageResult(t.Generic[EventType]):
         self._condition = condition
         self._event_type = event_type
         self._event = asyncio.Event()
-        self._result: t.Optional[EventType] = None
+        self._result: t.Optional[t.Union[Exception, EventType]] = None
 
     async def wait(self) -> EventType:
         """Waits for message to be set.
@@ -225,12 +224,15 @@ class MessageResult(t.Generic[EventType]):
         await self._event.wait()
         log.debug("Wait for %s complete", self._event_type)
 
+        if isinstance(self._result, Exception):
+            raise self._result
+
         # An event is only set when _result is added
         return t.cast(EventType, self._result)
 
     def set(
         self,
-        value: EventType,
+        value: t.Union[Exception, EventType],
     ) -> bool:
         """Attempts to set the message result.
 
@@ -244,7 +246,9 @@ class MessageResult(t.Generic[EventType]):
             bool: Whether the event matched the message result condition and
             was set.
         """
-        if isinstance(value, self._event_type) and (not self._condition or self._condition(value)):
+        if isinstance(value, Exception) or (
+            isinstance(value, self._event_type) and (not self._condition or self._condition(value))
+        ):
             log.debug("Setting result for %s", self._event_type)
             self._result = value
             self._event.set()
@@ -313,13 +317,17 @@ class AsyncRunspacePool:
 
     FIXME: Details about events.
 
+    Use the `is_available` attribute when calling :meth:`get_runspace_pools` to
+    determine if the Runspace Pool is available for reconnection. If it is not
+    available then the pool is still connected to by another client.
+
     Note:
         The `stream_*` attributes are largely unused by a Runspace Pool as
         stream data is typically targeted to a specific pipeline rather than a
         Runspace.
 
     Args:
-        connection: The async connection info used for this Runspace Pool.
+        connection_info: The connection info used for this Runspace Pool.
         apartment_state: Apartment state of the thread used to execute commands
             withih this RunspacePool.
         thread_options: Controls how new threads are created for each command
@@ -334,8 +342,9 @@ class AsyncRunspacePool:
         runspace_pool_id: Used internally for reconnection operations.
 
     Attributes:
-        connection: The async connection info used for this Runspace Pool.
         host: The PSHost associated with this Runspace Pool.
+        is_available: Whther the this Runspace pool is available and will
+            accept subsequent commands like `connect`, `open`, etc.
         pipeline_table: Mapping of all pipelines associated with this Runspace
             Pool.
         stream_debug: Contains any debug records sent to the Runspace Pool.
@@ -359,7 +368,7 @@ class AsyncRunspacePool:
 
     def __init__(
         self,
-        connection: AsyncConnectionInfo,
+        connection_info: ConnectionInfo,
         apartment_state: ApartmentState = ApartmentState.Unknown,
         thread_options: PSThreadOptions = PSThreadOptions.Default,
         min_runspaces: int = 1,
@@ -373,8 +382,9 @@ class AsyncRunspacePool:
                 "min_runspaces must be greater than 0 and max_runspaces must be greater than min_runspaces."
             )
 
-        self.connection = connection
+        self.connection_info = connection_info
         self.host = host
+        self.is_available = True
         self.pipeline_table: t.Dict[uuid.UUID, AsyncPipeline] = {}
         self.state_changed = AsyncEventHandler[RunspacePoolStateEvent]("RunspacePool state_changed")
         self.user_event = AsyncEventHandler[UserEventEvent]("RunspacePool user_event")
@@ -388,6 +398,8 @@ class AsyncRunspacePool:
         self.stream_verbose = AsyncPSDataCollection[VerboseRecord]()
         self.stream_warning = AsyncPSDataCollection[WarningRecord]()
 
+        self._connection: t.Optional[AsyncConnection] = None
+        self._connection_error: t.Optional[Exception] = None
         self._new_client = False  # Used for reconnection as a new client.
         self._pool = ClientRunspacePool(
             apartment_state=apartment_state,
@@ -399,8 +411,6 @@ class AsyncRunspacePool:
             runspace_pool_id=runspace_pool_id,
         )
         self._result_handler: t.List[MessageResult] = []
-
-        self.connection.register_pool_callback(self._pool.runspace_pool_id, self._event_received)
 
     async def __aenter__(self) -> "AsyncRunspacePool":
         if self.state == RunspacePoolState.Disconnected:
@@ -441,19 +451,48 @@ class AsyncRunspacePool:
     @classmethod
     async def get_runspace_pools(
         cls,
-        connection_info: AsyncConnectionInfo,
+        connection_info: ConnectionInfo,
         host: t.Optional[PSHost] = None,
     ) -> t.AsyncIterator["AsyncRunspacePool"]:
-        async for rpid, command_list in connection_info.enumerate():
-            runspace_pool = AsyncRunspacePool(connection_info, host=host, runspace_pool_id=rpid)
-            runspace_pool._pool.state = RunspacePoolState.Disconnected
-            runspace_pool._new_client = True
+        """Queries the server for Runspace Pools.
 
-            for cmd_id in command_list:
-                ps = AsyncPowerShell(runspace_pool)
-                ps._pipeline.pipeline_id = cmd_id
-                ps._pipeline.state = PSInvocationState.Disconnected
-                runspace_pool.pipeline_table[cmd_id] = ps
+        Queries the server for all the Runspace Pools that are either open and
+        in use or disconnected and ready for a connect operation. Each yielded
+        Runspace Pool can be reconnected to if the :attr:`is_available` is
+        `True` otherwise the pool is in use by another client.
+
+        The `host` provided will be associated with the Runspace Pool when it
+        is connected to.
+
+        Note:
+            Disconnection/Reconnection operations are only supported by the
+            WSMan connection type.
+
+        Args:
+            connection_info: The connection of the server to query.
+            host: The PSHost to associate with each yielded Runspace Pool.
+
+        Returns:
+            AsyncIterator[AsyncRunspacePool]: Iterates all the Runspace Pools
+            on the connection supplied. The :attr:`is_available` attribute can
+            be used to filter Runspace Pools that can be connected to.
+        """
+        async for res in connection_info.enumerate_async():
+            runspace_pool = AsyncRunspacePool(res.connection_info, host=host, runspace_pool_id=res.rpid)
+
+            if res.state == "Disconnected":
+                runspace_pool._pool.state = RunspacePoolState.Disconnected
+                runspace_pool._new_client = True
+
+                for pipeline in res.pipelines:
+                    ps = AsyncPowerShell(runspace_pool)
+                    ps._pipeline.pipeline_id = pipeline.pid
+                    ps._pipeline.state = PSInvocationState.Disconnected
+                    runspace_pool.pipeline_table[pipeline.pid] = ps
+
+            else:
+                runspace_pool._pool.state = RunspacePoolState.Opened
+                runspace_pool.is_available = False
 
             yield runspace_pool
 
@@ -461,6 +500,17 @@ class AsyncRunspacePool:
         return [p for p in self.pipeline_table.values() if p._pipeline.state == PSInvocationState.Disconnected]
 
     async def connect(self) -> None:
+        """Connects to a disconnected Runspace Pool.
+
+        Connected, or reconnects to an existing Runspace Pool. This is used
+        instead of :meth:`open` to connect to a Runspace Pool returned by
+        :meth:`get_runspace_pools`.
+
+        Note:
+            Disconnection/Reconnection operations are only supported by the
+            WSMan connection type.
+        """
+        connection = await self._get_connection()
         if self._new_client:
             sess_event = MessageResult(SessionCapabilityEvent)
             self._result_handler.append(sess_event)
@@ -472,7 +522,7 @@ class AsyncRunspacePool:
             self._result_handler.append(data_event)
 
             self._pool.connect()
-            await self.connection.connect(self._pool)
+            await connection.connect()
             await sess_event.wait()
             await init_event.wait()
             await data_event.wait()
@@ -480,7 +530,7 @@ class AsyncRunspacePool:
             self._new_client = False
 
         else:
-            await self.connection.reconnect(self._pool)
+            await connection.reconnect()
 
         self._pool.state = RunspacePoolState.Opened
 
@@ -491,11 +541,13 @@ class AsyncRunspacePool:
         be opened before it can be used.
         """
         log.info("Opening Runspace Pool - %s", self._pool.runspace_pool_id)
+
+        connection = await self._get_connection()
         self._pool.open()
 
         state_event = MessageResult(RunspacePoolStateEvent)
         self._result_handler.append(state_event)
-        await self.connection.create(self._pool)
+        await connection.create()
         await state_event.wait()
 
     async def close(self) -> None:
@@ -503,6 +555,7 @@ class AsyncRunspacePool:
 
         Closes the Runspace Pool freeing any resources on the server.
         """
+        connection = await self._get_connection()
         if self.state != RunspacePoolState.Disconnected:
             log.info("Closing Runspace Pool - %s", self._pool.runspace_pool_id)
             state_event = MessageResult(
@@ -513,12 +566,23 @@ class AsyncRunspacePool:
 
             for p in list(self.pipeline_table.values()):
                 await p.close()
-            await self.connection.close(self._pool)
+            await connection.close()
             await state_event.wait()
 
     async def disconnect(self) -> None:
+        """Disconnects a Runspace Pool.
+
+        Disconnects a Runspace Pool allowing it to be connected to for future
+        operations or by another client. A Runspace Pool must be disconnected
+        before a new client can connect to it.
+
+        Note:
+            Disconnection/Reconnection operations are only supported by the
+            WSMan connection type.
+        """
+        connection = await self._get_connection()
         self._pool.state = RunspacePoolState.Disconnecting
-        await self.connection.disconnect(self._pool)
+        await connection.disconnect()
         self._pool.state = RunspacePoolState.Disconnected
 
         for pipeline in self.pipeline_table.values():
@@ -534,11 +598,13 @@ class AsyncRunspacePool:
         without having first sent one.
         """
         log.info("Starting Runspace Pool Key Exchange - %s", self._pool.runspace_pool_id)
+
+        connection = await self._get_connection()
         event = MessageResult(EncryptedSessionKeyEvent)
         self._result_handler.append(event)
 
         self._pool.exchange_key()
-        await self.connection.send_all(self._pool)
+        await connection.send_all()
         await event.wait()
 
     async def reset_runspace_state(self) -> bool:
@@ -554,8 +620,9 @@ class AsyncRunspacePool:
         Returns:
             bool: Whether the reset was successful.
         """
+        connection = await self._get_connection()
         ci = self._pool.reset_runspace_state()
-        return await self._send_set_runspace_availability_ci(ci, "Resetting Runspace Pool State")
+        return await self._send_set_runspace_availability_ci(connection, ci, "Resetting Runspace Pool State")
 
     async def set_max_runspaces(
         self,
@@ -577,8 +644,9 @@ class AsyncRunspacePool:
         Returns:
             bool: Whether the change was succesful or not.
         """
+        connection = await self._get_connection()
         ci = self._pool.set_max_runspaces(value)
-        return await self._send_set_runspace_availability_ci(ci, f"Setting maximum pool count to {value}")
+        return await self._send_set_runspace_availability_ci(connection, ci, f"Setting maximum pool count to {value}")
 
     async def set_min_runspaces(
         self,
@@ -600,8 +668,9 @@ class AsyncRunspacePool:
         Returns:
             bool: Whether the change was succesful or not.
         """
+        connection = await self._get_connection()
         ci = self._pool.set_min_runspaces(value)
-        return await self._send_set_runspace_availability_ci(ci, f"Setting minimum pool count to {value}")
+        return await self._send_set_runspace_availability_ci(connection, ci, f"Setting minimum pool count to {value}")
 
     async def get_available_runspaces(self) -> int:
         """Get the number of available runspaces.
@@ -612,21 +681,43 @@ class AsyncRunspacePool:
         Returns:
             int: The number of available runspaces in the pool.
         """
+        connection = await self._get_connection()
         event = MessageResult(GetRunspaceAvailabilityEvent, lambda e: e.ci == ci)
         self._result_handler.append(event)
 
         ci = self._pool.get_available_runspaces()
 
         log.info("Getting available Runspace Pool Count - ci %s - %s", ci, self._pool.runspace_pool_id)
-        await self.connection.send_all(self._pool)
+        await connection.send_all()
         result = await event.wait()
 
         return result.count
 
+    async def _get_connection(self) -> AsyncConnection:
+        if not self.is_available:
+            raise RunspaceNotAvailable("This Runspace Pool is connected to another client")
+
+        if self._connection_error:
+            raise self._connection_error
+
+        if not self._connection:
+            self._connection = await self.connection_info.create_async(self._pool, self._event_received)
+
+        return self._connection
+
     async def _event_received(
         self,
-        event: PSRPEvent,
+        event: t.Union[Exception, PSRPEvent],
     ) -> bool:
+        if isinstance(event, Exception):
+            self._connection_error = event
+
+            for handler in list(self._result_handler):
+                if handler.set(event):
+                    self._result_handler.remove(handler)
+
+            return False
+
         if event.pipeline_id:
             pipeline = self.pipeline_table[event.pipeline_id]
             return await pipeline._event_received(event)
@@ -718,6 +809,7 @@ class AsyncRunspacePool:
 
     async def _send_set_runspace_availability_ci(
         self,
+        connection: AsyncConnection,
         ci: t.Optional[int],
         action: str,
     ) -> bool:
@@ -729,7 +821,7 @@ class AsyncRunspacePool:
         event = MessageResult(SetRunspaceAvailabilityEvent, lambda e: e.ci == ci)
         self._result_handler.append(event)
 
-        await self.connection.send_all(self._pool)
+        await connection.send_all()
         result = await event.wait()
 
         return result.success
@@ -790,7 +882,8 @@ class AsyncPipeline(t.Generic[PipelineType]):
                 return
 
             log.info("Closing pipeline - %s", self._pipeline.pipeline_id)
-            await self.runspace_pool.connection.close(self.runspace_pool._pool, self._pipeline.pipeline_id)
+            connection = await self.runspace_pool._get_connection()
+            await connection.close(self._pipeline.pipeline_id)
             del self.runspace_pool.pipeline_table[self._pipeline.pipeline_id]
 
     async def connect(self) -> t.List[t.Any]:
@@ -812,7 +905,8 @@ class AsyncPipeline(t.Generic[PipelineType]):
         task = asyncio.create_task(self._pipelines_task(task_ready, completed=completed))
         await task_ready.wait()
 
-        await self.runspace_pool.connection.connect(self.runspace_pool._pool, self._pipeline.pipeline_id)
+        connection = await self.runspace_pool._get_connection()
+        await connection.connect(self._pipeline.pipeline_id)
         self.runspace_pool.pipeline_table[self._pipeline.pipeline_id] = self
         self.runspace_pool._pool.pipeline_table[self._pipeline.pipeline_id] = self._pipeline
         self._pipeline.state = PSInvocationState.Running
@@ -932,8 +1026,9 @@ class AsyncPipeline(t.Generic[PipelineType]):
             self._pipeline.start()
 
         self.runspace_pool.pipeline_table[self._pipeline.pipeline_id] = self
-        await self.runspace_pool.connection.command(pool, self._pipeline.pipeline_id)
-        await self.runspace_pool.connection.send_all(pool)
+        connection = await self.runspace_pool._get_connection()
+        await connection.command(self._pipeline.pipeline_id)
+        await connection.send_all()
 
         if input_data is not None:
             log.debug("Sending pipeline input - %s", self._pipeline.pipeline_id)
@@ -958,13 +1053,13 @@ class AsyncPipeline(t.Generic[PipelineType]):
                     self._pipeline.send(data)
 
                 if buffer_input:
-                    await self.runspace_pool.connection.send(pool, buffer=True)
+                    await connection.send(buffer=True)
                 else:
-                    await self.runspace_pool.connection.send_all(pool)
+                    await connection.send_all()
 
             log.debug("Sending pipeline input eof - %s", self._pipeline.pipeline_id)
             self._pipeline.send_eof()
-            await self.runspace_pool.connection.send_all(pool)
+            await connection.send_all()
 
         return task
 
@@ -1009,9 +1104,10 @@ class AsyncPipeline(t.Generic[PipelineType]):
             wait until the stop was processed and acknowledged by the server.
         """
         log.info("Stopping pipeline - %s", self._pipeline.pipeline_id)
+        connection = await self.runspace_pool._get_connection()
 
         async def inner_stop() -> None:
-            await self.runspace_pool.connection.signal(self.runspace_pool._pool, self._pipeline.pipeline_id)
+            await connection.signal(self._pipeline.pipeline_id)
 
             if completed:
                 await _wrap_invoke(completed, purpose="stop_async")

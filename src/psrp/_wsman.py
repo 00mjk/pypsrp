@@ -78,6 +78,7 @@ class WSManAction(enum.Enum):
     ENUMERATE = "http://schemas.xmlsoap.org/ws/2004/09/enumeration/Enumerate"
     ENUMERATE_RESPONSE = "http://schemas.xmlsoap.org/ws/2004/09/enumeration/EnumerateResponse"
     FAULT = "http://schemas.dmtf.org/wbem/wsman/1/wsman/fault"
+    FAULT_ADDRESSING = "http://schemas.xmlsoap.org/ws/2004/08/addressing/fault"
     PULL = "http://schemas.xmlsoap.org/ws/2004/09/enumeration/Pull"
     PULL_RESPONSE = "http://schemas.xmlsoap.org/ws/2004/09/enumeration/PullResponse"
     COMMAND = "http://schemas.microsoft.com/wbem/wsman/1/windows/shell/Command"
@@ -97,7 +98,7 @@ class WSManAction(enum.Enum):
 
 
 class _WSManEventRegistry(type):
-    __registry: t.Dict[WSManAction, "_WSManEventRegistry"] = {}
+    __registry: t.Dict[str, "_WSManEventRegistry"] = {}
 
     def __init__(
         cls,
@@ -106,12 +107,12 @@ class _WSManEventRegistry(type):
     ) -> None:
         super().__init__(*args, **kwargs)
 
-        action = getattr(cls, "ACTION", None)
+        action: t.Optional[WSManAction] = getattr(cls, "ACTION", None)
         if action is None:
             return
 
-        if action not in cls.__registry:
-            cls.__registry[action] = cls
+        if action.value not in cls.__registry:
+            cls.__registry[action.value] = cls
 
     def __call__(  # type: ignore[override]
         cls,
@@ -122,7 +123,7 @@ class _WSManEventRegistry(type):
             # FIXME: Use proper exception
             raise ValueError("Invalid ElementTree for a WSMan event")
 
-        new_cls = cls.__registry.get(WSManAction(action.text), cls)
+        new_cls = cls.__registry.get(action.text or "", cls)
         return super(_WSManEventRegistry, new_cls).__call__(data)
 
 
@@ -201,6 +202,10 @@ class FaultEvent(WSManEvent):
     ):
         super().__init__(data)
         self.error = _parse_wsman_fault(data)
+
+
+class FaultAddressingEvent(FaultEvent):
+    ACTION = WSManAction.FAULT_ADDRESSING
 
 
 class PullEvent(WSManEvent):

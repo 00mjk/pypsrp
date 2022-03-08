@@ -33,7 +33,7 @@ from psrpcore.types import (
     RunspacePoolState,
 )
 
-from ._connection.connection_info import ConnectionInfo
+from ._connection.connection import SyncConnection
 from ._host import PSHost, get_host_method
 
 
@@ -98,7 +98,7 @@ class PipelineTask:
 class RunspacePool:
     def __init__(
         self,
-        connection: ConnectionInfo,
+        connection: SyncConnection,
         apartment_state: ApartmentState = ApartmentState.Unknown,
         thread_options: PSThreadOptions = PSThreadOptions.Default,
         min_runspaces: int = 1,
@@ -246,7 +246,7 @@ class RunspacePool:
     @classmethod
     def get_runspace_pool(
         cls,
-        connection_info: ConnectionInfo,
+        connection_info: SyncConnection,
         host: typing.Optional[PSHost] = None,
     ) -> typing.Iterable["RunspacePool"]:
         for rpid, command_list in connection_info.enumerate():

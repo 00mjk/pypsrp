@@ -12,31 +12,38 @@ import xml.etree.ElementTree as ElementTree
 
 from psrpcore import ClientRunspacePool, PSRPPayload, StreamType
 
-from psrp._connection.connection_info import AsyncConnectionInfo, ConnectionInfo
+from psrp._connection.connection import (
+    AsyncConnection,
+    AsyncEventCallable,
+    SyncConnection,
+    SyncEventCallable,
+)
 
 log = logging.getLogger(__name__)
 
 _EMPTY_UUID = uuid.UUID(int=0)
 
 
-class OutOfProcInfo(ConnectionInfo):
+class OutOfProcConnection(SyncConnection):
     def __new__(
         cls,
         *args: t.Any,
         **kwargs: t.Any,
-    ) -> "OutOfProcInfo":
-        if cls == OutOfProcInfo:
+    ) -> "OutOfProcConnection":
+        if cls == OutOfProcConnection:
             raise TypeError(
                 f"Type {cls.__qualname__} cannot be instantiated; it can be used only as a base class for "
                 f"PSRP out of process connection implementations."
             )
 
-        return super().__new__(cls)  # type: ignore[return-value] # This returns OutOfProcInfo
+        return super().__new__(cls)  # type: ignore[return-value] # This returns OutOfProcConnection
 
     def __init__(
         self,
+        pool: ClientRunspacePool,
+        callback: SyncEventCallable,
     ) -> None:
-        super().__init__()
+        super().__init__(pool, callback)
 
         self.__listen_task: t.Optional[threading.Thread] = None
         self.__wait_condition = threading.Condition()
@@ -88,7 +95,6 @@ class OutOfProcInfo(ConnectionInfo):
 
     def close(
         self,
-        pool: ClientRunspacePool,
         pipeline_id: t.Optional[uuid.UUID] = None,
     ) -> None:
         with self.__wait_condition:
@@ -105,7 +111,6 @@ class OutOfProcInfo(ConnectionInfo):
 
     def command(
         self,
-        pool: ClientRunspacePool,
         pipeline_id: uuid.UUID,
     ) -> None:
         with self.__wait_condition:
@@ -113,24 +118,20 @@ class OutOfProcInfo(ConnectionInfo):
                 self.write(_ps_guid_packet("Command", ps_guid=pipeline_id))
             self._wait_ack("Command", pipeline_id)
 
-        self.send(pool)
+        self.send()
 
-    def create(
-        self,
-        pool: ClientRunspacePool,
-    ) -> None:
+    def create(self) -> None:
         self.start()
-        self.__listen_task = threading.Thread(target=self._listen, args=(pool,))
+        self.__listen_task = threading.Thread(target=self._listen)
         self.__listen_task.start()
 
-        self.send(pool)
+        self.send()
 
     def send(
         self,
-        pool: ClientRunspacePool,
         buffer: bool = False,
     ) -> bool:
-        payload = self.next_payload(pool, buffer=buffer)
+        payload = self.next_payload(buffer=buffer)
         if not payload:
             return False
 
@@ -143,7 +144,6 @@ class OutOfProcInfo(ConnectionInfo):
 
     def signal(
         self,
-        pool: ClientRunspacePool,
         pipeline_id: uuid.UUID,
     ) -> None:
         with self.__wait_condition:
@@ -160,10 +160,7 @@ class OutOfProcInfo(ConnectionInfo):
         self.__wait_table.append(key)
         self.__wait_condition.wait_for(lambda: key not in self.__wait_table)
 
-    def _listen(
-        self,
-        pool: ClientRunspacePool,
-    ) -> None:
+    def _listen(self) -> None:
         while True:
             data = self.read()
             if not data:
@@ -178,26 +175,22 @@ class OutOfProcInfo(ConnectionInfo):
             payload_data: t.Optional[PSRPPayload] = None
             if data:
                 payload_data = PSRPPayload(data, StreamType.default, ps_guid)
+                self.process_response(payload_data)
 
             tag = packet.tag
-            if tag == "Data":
-                self.process_response(pool, payload_data)
-
-            else:
+            if tag != "Data":
                 with self.__wait_condition:
                     self.__wait_table.remove((tag, ps_guid))
                     self.__wait_condition.notify_all()
 
-        self.process_response(pool, None)
 
-
-class AsyncOutOfProcInfo(AsyncConnectionInfo):
+class AsyncOutOfProcConnection(AsyncConnection):
     def __new__(
         cls,
         *args: t.Any,
         **kwargs: t.Any,
-    ) -> "AsyncOutOfProcInfo":
-        if cls == AsyncOutOfProcInfo:
+    ) -> "AsyncOutOfProcConnection":
+        if cls == AsyncOutOfProcConnection:
             raise TypeError(
                 f"Type {cls.__qualname__} cannot be instantiated; it can be used only as a base class for "
                 f"PSRP out of process connection implementations."
@@ -207,8 +200,10 @@ class AsyncOutOfProcInfo(AsyncConnectionInfo):
 
     def __init__(
         self,
+        pool: ClientRunspacePool,
+        callback: AsyncEventCallable,
     ) -> None:
-        super().__init__()
+        super().__init__(pool, callback)
 
         self.__listen_task: t.Optional[asyncio.Task] = None
         self.__wait_condition = asyncio.Condition()
@@ -260,7 +255,6 @@ class AsyncOutOfProcInfo(AsyncConnectionInfo):
 
     async def close(
         self,
-        pool: ClientRunspacePool,
         pipeline_id: t.Optional[uuid.UUID] = None,
     ) -> None:
         async with self.__wait_condition:
@@ -277,7 +271,6 @@ class AsyncOutOfProcInfo(AsyncConnectionInfo):
 
     async def command(
         self,
-        pool: ClientRunspacePool,
         pipeline_id: uuid.UUID,
     ) -> None:
         async with self.__wait_condition:
@@ -285,23 +278,21 @@ class AsyncOutOfProcInfo(AsyncConnectionInfo):
                 await self.write(_ps_guid_packet("Command", ps_guid=pipeline_id))
             await self._wait_ack("Command", pipeline_id)
 
-        await self.send(pool)
+        await self.send()
 
     async def create(
         self,
-        pool: ClientRunspacePool,
     ) -> None:
         await self.start()
-        self.__listen_task = asyncio.create_task(self._listen(pool))
+        self.__listen_task = asyncio.create_task(self._listen())
 
-        await self.send(pool)
+        await self.send()
 
     async def send(
         self,
-        pool: ClientRunspacePool,
         buffer: bool = False,
     ) -> bool:
-        payload = self.next_payload(pool, buffer=buffer)
+        payload = self.next_payload(buffer=buffer)
         if not payload:
             return False
 
@@ -315,7 +306,6 @@ class AsyncOutOfProcInfo(AsyncConnectionInfo):
 
     async def signal(
         self,
-        pool: ClientRunspacePool,
         pipeline_id: uuid.UUID,
     ) -> None:
         async with self.__wait_condition:
@@ -335,10 +325,7 @@ class AsyncOutOfProcInfo(AsyncConnectionInfo):
         if self.__listen_task and self.__listen_task.done():
             self.__listen_task.result()
 
-    async def _listen(
-        self,
-        pool: ClientRunspacePool,
-    ) -> None:
+    async def _listen(self) -> None:
         buffer = bytearray()
         out_of_band_reqs: t.List[asyncio.Task] = []
 
@@ -373,13 +360,11 @@ class AsyncOutOfProcInfo(AsyncConnectionInfo):
                 payload_data: t.Optional[PSRPPayload] = None
                 if data:
                     payload_data = PSRPPayload(data, StreamType.default, ps_guid)
-
-                if packet.tag == "Data":
-                    data_available = await self.process_response(pool, payload_data)
+                    data_available = await self.process_response(payload_data)
                     if data_available:
-                        out_of_band_reqs.append(asyncio.create_task(self.send_all(pool)))
+                        out_of_band_reqs.append(asyncio.create_task(self.send_all()))
 
-                else:
+                if packet.tag != "Data":
                     async with self.__wait_condition:
                         self.__wait_table.remove((packet.tag, ps_guid))
                         self.__wait_condition.notify_all()
@@ -390,7 +375,6 @@ class AsyncOutOfProcInfo(AsyncConnectionInfo):
                         out_of_band_reqs.remove(task)
 
         finally:
-            await self.process_response(pool, None)
             async with self.__wait_condition:
                 self.__wait_table = []
                 self.__wait_condition.notify_all()

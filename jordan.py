@@ -7,14 +7,14 @@ from psrpcore.types import ConsoleColor, Coordinates, PipelineResultTypes, Size
 
 from psrp import (
     AsyncPowerShell,
-    AsyncProcessInfo,
+    AsyncProcessConnection,
     AsyncRunspacePool,
     AsyncSSHInfo,
-    AsyncWSManInfo,
+    AsyncWSManConnection,
     PowerShell,
-    ProcessInfo,
+    ProcessConnection,
     RunspacePool,
-    WSManInfo,
+    WSManConnection,
 )
 from psrp._host import PSHost, PSHostRawUI, PSHostUI
 
@@ -210,7 +210,7 @@ async def async_main():
         #     )
         # ),
         # # http_nego_http_anon
-        async_psrp(AsyncWSManInfo(f"http://test.wsman.env:29938/wsman", proxy="http://squid.wsman.env:3129/")),
+        async_psrp(AsyncWSManConnection(f"http://test.wsman.env:29938/wsman", proxy="http://squid.wsman.env:3129/")),
         # # http_nego_https_anon
         # async_psrp(
         #     AsyncWSManInfo(
@@ -651,7 +651,7 @@ def sync_main():
         log.setLevel(logging.DEBUG)
         log.addHandler(handler)
 
-    info = WSManInfo("http://server2019.domain.test:5985/wsman")
+    info = WSManConnection("http://server2019.domain.test:5985/wsman")
     with RunspacePool(info) as pool:
         # ps = PowerShell(pool)
         # ps.add_script("echo 'hi'")

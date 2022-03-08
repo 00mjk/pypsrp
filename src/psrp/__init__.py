@@ -8,31 +8,38 @@ from psrp._async import (
     AsyncPSDataCollection,
     AsyncRunspacePool,
 )
-from psrp._connection.connection_info import (
-    AsyncConnectionInfo,
+from psrp._connection.connection import (
+    AsyncConnection,
+    AsyncEventCallable,
     ConnectionInfo,
     OutputBufferingMode,
+    SyncConnection,
+    SyncEventCallable,
 )
-from psrp._connection.out_of_proc import AsyncOutOfProcInfo, OutOfProcInfo
-from psrp._connection.process import AsyncProcessInfo, ProcessInfo
-from psrp._connection.ssh import AsyncSSHInfo
-from psrp._connection.wsman import AsyncWSManInfo, WSManConnectionData, WSManInfo
-from psrp._exceptions import PipelineFailed, PipelineStopped, PSRPError
+from psrp._connection.out_of_proc import AsyncOutOfProcConnection, OutOfProcConnection
+from psrp._connection.process import ProcessInfo
+from psrp._connection.ssh import SSHInfo
+from psrp._connection.wsman import WSManInfo
+from psrp._exceptions import (
+    PipelineFailed,
+    PipelineStopped,
+    PSRPError,
+    RunspaceNotAvailable,
+)
 from psrp._host import PSHost, PSHostRawUI, PSHostUI
+from psrp._io.wsman import WSManConnectionData
 from psrp._sync import PowerShell, PSDataStream, RunspacePool
 
 __all__ = [
     "AsyncCommandMetaPipeline",
-    "AsyncConnectionInfo",
-    "AsyncOutOfProcInfo",
+    "AsyncConnection",
+    "AsyncEventCallable",
+    "AsyncOutOfProcConnection",
     "AsyncPowerShell",
-    "AsyncProcessInfo",
     "AsyncPSDataCollection",
     "AsyncRunspacePool",
-    "AsyncSSHInfo",
-    "AsyncWSManInfo",
     "ConnectionInfo",
-    "OutOfProcInfo",
+    "OutOfProcConnection",
     "OutputBufferingMode",
     "PipelineFailed",
     "PipelineStopped",
@@ -43,7 +50,11 @@ __all__ = [
     "PSHostRawUI",
     "PSHostUI",
     "PSRPError",
+    "RunspaceNotAvailable",
     "RunspacePool",
+    "SSHInfo",
+    "SyncConnection",
+    "SyncEventCallable",
     "WSManConnectionData",
     "WSManInfo",
 ]

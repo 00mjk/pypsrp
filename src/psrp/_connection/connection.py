@@ -12,6 +12,127 @@ from psrpcore import ClientRunspacePool, PSRPEvent, PSRPPayload
 
 log = logging.getLogger(__name__)
 
+T = t.TypeVar("T", bound=t.Callable)
+AsyncEventCallable = t.Callable[[t.Union[Exception, PSRPEvent]], t.Awaitable[bool]]
+SyncEventCallable = t.Callable[[t.Union[Exception, PSRPEvent]], bool]
+
+
+class ConnectionInfo:
+    """Base class for all connection info implementations.
+
+    This is the base class for all connection info implementation that document
+    the methods that must be implemented for the code to create a new
+    connection class. Currently :meth:`create_sync` will be called when
+    creating a synchronous Runspace Pool and :meth:`create_async` will be
+    called when creating an asyncio based Runspace Pool.
+    """
+
+    def create_sync(
+        self,
+        pool: ClientRunspacePool,
+        callback: SyncEventCallable,
+    ) -> "SyncConnection":
+        """Create new synchronous connection.
+
+        Creates a new synchronous connection for the Runspace Pool to use. The
+        connection should be initialised and ready to send the first PSRP
+        fragment.
+
+        Args:
+            pool: The Runspace Pool state manager for the connection.
+            callback: The callback method used by the connection to call when
+                a new PSRP event is available.
+        """
+        raise NotImplementedError()
+
+    async def create_async(
+        self,
+        pool: ClientRunspacePool,
+        callback: AsyncEventCallable,
+    ) -> "AsyncConnection":
+        """Create new asynchronous connection.
+
+        Creates a new asynchronous connection for the Runspace Pool to use. The
+        connection should be initialised and ready to send the first PSRP
+        fragment.
+
+        Args:
+            pool: The Runspace Pool state manager for the connection.
+            callback: The callback coroutine used by the connection to call
+                when a new PSRP event is available.
+        """
+        raise NotImplementedError()
+
+    def enumerate_sync(self) -> t.Iterator["EnumerationRunspaceResult"]:
+        """Find Runspace Pools or Pipelines.
+
+        Find all the Runspace Pools or Pipelines on the connection. This is
+        used to enumerate any disconnected Runspace Pools or Pipelines when
+        requested by the caller.
+
+        Note:
+            This is an optonal feature and is currently only implemented for
+            the WSMan connection.
+
+        Returns:
+            Iterator[EnumerationRunspaceResult]: Will yield information about
+            all the Runspace pools on the target and their pipelines.
+        """
+        raise NotImplementedError("Disconnection operation not implemented on this connection type")
+
+    async def enumerate_async(self) -> t.AsyncIterator["EnumerationRunspaceResult"]:
+        """Find Runspace Pools or Pipelines.
+
+        Find all the Runspace Pools or Pipelines on the connection. This is
+        used to enumerate any disconnected Runspace Pools or Pipelines when
+        requested by the caller.
+
+        Note:
+            This is an optonal feature and is currently only implemented for
+            the WSMan connection.
+
+        Returns:
+            AsyncIterator[EnumerationRunspaceResult]: Will yield information
+            about all the Runspace pools on the target and their pipelines.
+        """
+        raise NotImplementedError("Disconnection operation not implemented on this connection type")
+        yield  # type: ignore[unreachable]  # The yield is needed for mypy to see this as an Iterator
+
+
+class EnumerationRunspaceResult(t.NamedTuple):
+    """Information about a Runspace Pool enumeration.
+
+    This is used by the `enumerate` method to return information about the
+    Runspace Pools that are available on the target connection.
+
+    Attributes:
+        connection_info: The connection info used to create a new connection
+            for the Runspace Pool.
+        rpid: The Runspace Pool ID this entry represents.
+        state: The state of the Runspace Pool.
+        pipelines: List of pipelines associated with the Runspace Pool.
+    """
+
+    connection_info: ConnectionInfo
+    rpid: uuid.UUID
+    state: str
+    pipelines: t.List["EnumerationPipelineResult"]
+
+
+class EnumerationPipelineResult(t.NamedTuple):
+    """Information about a Pipeline enumeration.
+
+    This is used by the `enumerate` method to return information about the
+    Pipelines of a Runspace Pool that are available on the target connection.
+
+    Attributes:
+        pid: The Pipeline ID this entry represents.
+        state: The state of the Pipeline.
+    """
+
+    pid: uuid.UUID
+    state: str
+
 
 class OutputBufferingMode(enum.Enum):
     """Output Buffer Mode for disconnecting Runspaces.
@@ -33,13 +154,13 @@ class OutputBufferingMode(enum.Enum):
     DROP = enum.auto()
 
 
-class _ConnectionInfoBase:
+class _ConnectionBase:
     def __new__(
         cls,
         *args: t.Any,
         **kwargs: t.Any,
-    ) -> "_ConnectionInfoBase":
-        if cls in [_ConnectionInfoBase, ConnectionInfo, AsyncConnectionInfo]:
+    ) -> "_ConnectionBase":
+        if cls in [_ConnectionBase, SyncConnection, AsyncConnection]:
             raise TypeError(
                 f"Type {cls.__qualname__} cannot be instantiated; it can be used only as a base class for "
                 f"PSRP connection implementations."
@@ -49,25 +170,33 @@ class _ConnectionInfoBase:
 
     def __init__(
         self,
-    ) -> None:
-        self.__buffer: t.Dict[uuid.UUID, bytearray] = {}
-
-    def get_fragment_size(
-        self,
         pool: ClientRunspacePool,
-    ) -> int:
+    ) -> None:
+        self.__buffer = bytearray()
+        self.__pool = pool
+
+    def get_fragment_size(self) -> int:
         """Get the max PSRP fragment size.
 
-        Gets the maximum size allowed for PSRP fragments in this Runspace Pool.
+        Gets the maximum size allowed for PSRP fragments for this connection.
 
         Returns:
             int: The max fragment size.
         """
         return 32_768  # Used as a default for all OutOfProc transports.
 
+    def get_runspace_pool(self) -> ClientRunspacePool:
+        """Get the Runspace Pool state manager.
+
+        Gets the Runspace Pool state manager for the connection info to use.
+
+        Returns:
+            ClientRunspacePool: The Runspace Pool state manager.
+        """
+        return self.__pool
+
     def next_payload(
         self,
-        pool: ClientRunspacePool,
         buffer: bool = False,
     ) -> t.Optional[PSRPPayload]:
         """Get the next payload.
@@ -75,64 +204,45 @@ class _ConnectionInfoBase:
         Get the next payload to exchange if there are any.
 
         Args:
-            pool: The Runspace Pool to get the next payload for.
             buffer: Wait until the buffer as set by :meth:`get_fragment_size`
                 has been reached before sending the payload.
 
         Returns:
-            Optional[PSRPPayload]: The PSRP payload to send if there is
-                one.
+            Optional[PSRPPayload]: The PSRP payload to send if there is one.
         """
-        pool_buffer = self.__buffer.setdefault(pool.runspace_pool_id, bytearray())
-        fragment_size = self.get_fragment_size(pool)
-        psrp_payload = pool.data_to_send(fragment_size - len(pool_buffer))
+        data_buffer = self.__buffer
+        fragment_size = self.get_fragment_size()
+        psrp_payload = self.__pool.data_to_send(fragment_size - len(data_buffer))
         if not psrp_payload:
             return None
 
-        pool_buffer += psrp_payload.data
-        if buffer and len(pool_buffer) < fragment_size:
+        data_buffer += psrp_payload.data
+        if buffer and len(data_buffer) < fragment_size:
             return None
 
         # No longer need the buffer for now
-        del self.__buffer[pool.runspace_pool_id]
+        self.__buffer = bytearray()
         return PSRPPayload(
-            pool_buffer,
+            data_buffer,
             psrp_payload.stream_type,
             psrp_payload.pipeline_id,
         )
 
 
-class ConnectionInfo(_ConnectionInfoBase):
+class SyncConnection(_ConnectionBase):
     """Base class used for synchronous connection info implementations."""
 
     def __init__(
         self,
+        pool: ClientRunspacePool,
+        callback: SyncEventCallable,
     ) -> None:
-        super().__init__()
-
-        self.__event_callback: t.Dict[uuid.UUID, t.Callable[[PSRPEvent], bool]] = {}
-
-    def register_pool_callback(
-        self,
-        runspace_pool_id: uuid.UUID,
-        callback: t.Callable[[PSRPEvent], bool],
-    ) -> None:
-        """Register callback function for pool.
-
-        Registers the callback function for a Runspace Pool that is called when
-        a new PSRP event is available.
-
-        Args:
-            runspace_pool_id: The Runspace Pool identifier to register the
-                callback on.
-            callback: The function to invoke when a new event is available.
-        """
-        self.__event_callback[runspace_pool_id] = callback
+        super().__init__(pool)
+        self.__event_callback = callback
 
     def process_response(
         self,
-        pool: ClientRunspacePool,
-        data: t.Optional[t.Union[PSRPEvent, PSRPPayload]] = None,
+        data: t.Union[Exception, PSRPEvent, PSRPPayload],
     ) -> bool:
         """Process an incoming PSRP payload.
 
@@ -143,28 +253,27 @@ class ConnectionInfo(_ConnectionInfoBase):
         the pool.
 
         Args:
-            pool: The Runspace Pool the payload is for.
-            data: The PSRPPayload or PSRPEvent to process. Will be None to
-                signify no more data is expected for this pool.
+            data: The PSRPPayload or PSRPEvent to process. Can also be an
+                Exception which occurs when there was an unhandled failure in
+                the listener and will notify the Runspace Pool handler.
 
         Returns:
             bool: A response has been queued on the internal pool that needs to
-                be sent to the peer.
+            be sent to the peer.
         """
-        callback = self.__event_callback[pool.runspace_pool_id]
-
+        pool = self.get_runspace_pool()
         if isinstance(data, PSRPEvent):
             log.debug("Calling Pool callback for %s - %r", pool.runspace_pool_id, data)
-            return callback(data)
+            return self.__event_callback(data)
 
-        if data:
+        elif isinstance(data, Exception):
+            log.debug("Exception encountered in listener, notifying pool %s - %s", pool.runspace_pool_id, data)
+            return self.__event_callback(data)
+
+        else:
             if log.isEnabledFor(logging.DEBUG):
                 log.debug("Processing PSRP data %s", base64.b64encode(data.data).decode())
             pool.receive_data(data)
-
-        else:
-            log.debug("Received close signal for pool %s", pool.runspace_pool_id)
-            del self.__event_callback[pool.runspace_pool_id]
 
         data_queued = False
         while True:
@@ -173,7 +282,7 @@ class ConnectionInfo(_ConnectionInfoBase):
                 break
 
             log.debug("Calling Pool callback for %s - %r", pool.runspace_pool_id, event)
-            res = callback(event)
+            res = self.__event_callback(event)
             if res:
                 data_queued = True
 
@@ -185,7 +294,6 @@ class ConnectionInfo(_ConnectionInfoBase):
 
     def close(
         self,
-        pool: ClientRunspacePool,
         pipeline_id: t.Optional[uuid.UUID] = None,
     ) -> None:
         """Close the Runspace Pool/Pipeline.
@@ -195,14 +303,12 @@ class ConnectionInfo(_ConnectionInfoBase):
         being used.
 
         Args:
-            pool: The Runspace Pool to close.
             pipeline_id: Closes this pipeline in the Runspace Pool.
         """
         raise NotImplementedError()
 
     def command(
         self,
-        pool: ClientRunspacePool,
         pipeline_id: uuid.UUID,
     ) -> None:
         """Create the pipeline.
@@ -211,45 +317,31 @@ class ConnectionInfo(_ConnectionInfoBase):
         fragment of the `CreatePipeline` PSRP message.
 
         Args:
-            pool: The Runspace Pool to create the pipeline in.
             pipeline_id: The Pipeline ID that needs to be created.
         """
         raise NotImplementedError()
 
-    def create(
-        self,
-        pool: ClientRunspacePool,
-    ) -> None:
+    def create(self) -> None:
         """Create the Runspace Pool
 
         Creates the Runspace Pool specified. This should send only one fragment
         that contains at least the `SessionCapability` PSRP message. If more
         fragments can fit inside the payload they should also be sent.
-
-        Args:
-            pool: The Runspace Pool to create.
         """
         raise NotImplementedError()
 
-    def send_all(
-        self,
-        pool: ClientRunspacePool,
-    ) -> None:
+    def send_all(self) -> None:
         """Send all PSRP payloads.
 
         Send all PSRP payloads that are ready to send.
-
-        Args:
-            pool: The Runspace Pool to send all payloads to.
         """
         while True:
-            sent = self.send(pool)
+            sent = self.send()
             if not sent:
                 return
 
     def send(
         self,
-        pool: ClientRunspacePool,
         buffer: bool = False,
     ) -> bool:
         """Send PSRP payload.
@@ -257,20 +349,18 @@ class ConnectionInfo(_ConnectionInfoBase):
         Send the next PSRP payload for the Runspace Pool.
 
         Args:
-            pool: The Runspace Pool to send the payload to.
             buffer: When set to `False` will always send the payload regardless
                 of the size. When set to `True` will only send the payload if
                 it hits the max fragment size.
 
         Returns:
             bool: Set to `True` if a payload was sent and `False` if there was
-                no payloads for the pool to send.
+            no payloads for the pool to send.
         """
         raise NotImplementedError()
 
     def signal(
         self,
-        pool: ClientRunspacePool,
         pipeline_id: uuid.UUID,
     ) -> None:
         """Send a signal to the Runspace Pool/Pipeline
@@ -279,7 +369,6 @@ class ConnectionInfo(_ConnectionInfoBase):
         uses a signal to a Pipeline to request the pipeline to stop.
 
         Args:
-            pool: The Runspace Pool that contains the pipeline to signal.
             pipeline_id: The pipeline to send the signal to.
         """
         raise NotImplementedError()
@@ -290,7 +379,6 @@ class ConnectionInfo(_ConnectionInfoBase):
 
     def connect(
         self,
-        pool: ClientRunspacePool,
         pipeline_id: t.Optional[uuid.UUID] = None,
     ) -> None:
         """Connect to a Runspace Pool/Pipeline.
@@ -300,88 +388,43 @@ class ConnectionInfo(_ConnectionInfoBase):
         implemented for the core PSRP scenarios.
 
         Args:
-            pool: The Runspace Pool to connect to.
             pipeline_id: If connecting to a pipeline, this is the pipeline id.
         """
         raise NotImplementedError("Disconnection operation not implemented on this connection type")
 
-    def disconnect(
-        self,
-        pool: ClientRunspacePool,
-    ) -> None:
+    def disconnect(self) -> None:
         """Disconnect a Runspace Pool.
 
         Disconnects from a Runspace Pool so another client can connect to it.
         This is an optional feature that does not have to be implemented for
         the core PSRP scenarios.
-
-        Args:
-            pool: The Runspace Pool to disconnect.
         """
         raise NotImplementedError("Disconnection operation not implemented on this connection type")
 
-    def reconnect(
-        self,
-        pool: ClientRunspacePool,
-    ) -> None:
+    def reconnect(self) -> None:
         """Reconnect a Runspace Pool.
 
         Reconnect to a Runspace Pool that has been disconnected by the same
         client. This is an optional feature that does not have to be
         implemented for the core PSRP scenarios.
-
-        Args:
-            pool: The Runspace Pool to disconnect.
-        """
-        raise NotImplementedError("Disconnection operation not implemented on this connection type")
-
-    def enumerate(self) -> t.Iterator[t.Tuple[uuid.UUID, t.List[uuid.UUID]]]:
-        """Find Runspace Pools or Pipelines.
-
-        Find all the Runspace Pools or Pipelines on the connection. This is
-        used to enumerate any disconnected Runspace Pools or Pipelines for
-        :meth:`connect` and :meth:`reconnect`. This is an optional feature
-        that does not have to be implemented for the core PSRP scenarios.
-
-        Returns:
-            Iterator[Tuple[uuid.UUID, List[uuid.UUID]]]: Will yield tuples that
-                contains the Runspace Pool ID with a list of all the pipeline
-                IDs for that Runspace Pool.
         """
         raise NotImplementedError("Disconnection operation not implemented on this connection type")
 
 
-class AsyncConnectionInfo(_ConnectionInfoBase):
+class AsyncConnection(_ConnectionBase):
     """Base class used for asyncio connection info implementations."""
 
     def __init__(
         self,
+        pool: ClientRunspacePool,
+        callback: AsyncEventCallable,
     ) -> None:
-        super().__init__()
-
-        self.__event_callback: t.Dict[uuid.UUID, t.Callable[[PSRPEvent], t.Awaitable[bool]]] = {}
-
-    def register_pool_callback(
-        self,
-        runspace_pool_id: uuid.UUID,
-        callback: t.Callable[[PSRPEvent], t.Awaitable[bool]],
-    ) -> None:
-        """Register callback coroutine for pool.
-
-        Registers the callback coroutine for a Runspace Pool that is called
-        when a new PSRP event is available.
-
-        Args:
-            runspace_pool_id: The Runspace Pool identifier to register the
-                callback on.
-            callback: The coroutine to invoke when a new event is available.
-        """
-        self.__event_callback[runspace_pool_id] = callback
+        super().__init__(pool)
+        self.__event_callback = callback
 
     async def process_response(
         self,
-        pool: ClientRunspacePool,
-        data: t.Optional[t.Union[PSRPEvent, PSRPPayload]] = None,
+        data: t.Union[Exception, PSRPEvent, PSRPPayload],
     ) -> bool:
         """Process an incoming PSRP payload.
 
@@ -392,28 +435,28 @@ class AsyncConnectionInfo(_ConnectionInfoBase):
         the pool.
 
         Args:
-            pool: The Runspace Pool the payload is for.
-            data: The PSRPPayload or PSRPEvent to process. Will be None to
-                signify no more data is expected for this pool.
+            data: The PSRPPayload or PSRPEvent to process. Can also be an
+                Exception which occurs when there was an unhandled failure in
+                the listener and will notify the Runspace Pool handler.
 
         Returns:
             bool: A response has been queued on the internal pool that needs to
-                be sent to the peer.
+            be sent to the peer.
         """
-        callback = self.__event_callback[pool.runspace_pool_id]
+        pool = self.get_runspace_pool()
 
         if isinstance(data, PSRPEvent):
             log.debug("Calling Pool callback for %s - %r", pool.runspace_pool_id, data)
-            return await callback(data)
+            return await self.__event_callback(data)
 
-        if data:
+        elif isinstance(data, Exception):
+            log.debug("Exception encountered in listener, notifying pool %s - %s", pool.runspace_pool_id, data)
+            return await self.__event_callback(data)
+
+        else:
             if log.isEnabledFor(logging.DEBUG):
                 log.debug("Processing PSRP data %s", base64.b64encode(data.data).decode())
             pool.receive_data(data)
-
-        else:
-            log.debug("Received close signal for pool %s", pool.runspace_pool_id)
-            del self.__event_callback[pool.runspace_pool_id]
 
         data_queued = False
         while True:
@@ -422,7 +465,7 @@ class AsyncConnectionInfo(_ConnectionInfoBase):
                 break
 
             log.debug("Calling Pool callback for %s - %r", pool.runspace_pool_id, event)
-            res = await callback(event)
+            res = await self.__event_callback(event)
             if res:
                 data_queued = True
 
@@ -434,7 +477,6 @@ class AsyncConnectionInfo(_ConnectionInfoBase):
 
     async def close(
         self,
-        pool: ClientRunspacePool,
         pipeline_id: t.Optional[uuid.UUID] = None,
     ) -> None:
         """Close the Runspace Pool/Pipeline.
@@ -444,14 +486,12 @@ class AsyncConnectionInfo(_ConnectionInfoBase):
         being used.
 
         Args:
-            pool: The Runspace Pool to close.
             pipeline_id: Closes this pipeline in the Runspace Pool.
         """
         raise NotImplementedError()
 
     async def command(
         self,
-        pool: ClientRunspacePool,
         pipeline_id: uuid.UUID,
     ) -> None:
         """Create the pipeline.
@@ -460,45 +500,31 @@ class AsyncConnectionInfo(_ConnectionInfoBase):
         fragment of the `CreatePipeline` PSRP message.
 
         Args:
-            pool: The Runspace Pool to create the pipeline in.
             pipeline_id: The Pipeline ID that needs to be created.
         """
         raise NotImplementedError()
 
-    async def create(
-        self,
-        pool: ClientRunspacePool,
-    ) -> None:
+    async def create(self) -> None:
         """Create the Runspace Pool
 
         Creates the Runspace Pool specified. This should send only one fragment
         that contains at least the `SessionCapability` PSRP message. If more
         fragments can fit inside the payload they should also be sent.
-
-        Args:
-            pool: The Runspace Pool to create.
         """
         raise NotImplementedError()
 
-    async def send_all(
-        self,
-        pool: ClientRunspacePool,
-    ) -> None:
+    async def send_all(self) -> None:
         """Send all PSRP payloads.
 
         Send all PSRP payloads that are ready to send.
-
-        Args:
-            pool: The Runspace Pool to send all payloads to.
         """
         while True:
-            sent = await self.send(pool)
+            sent = await self.send()
             if not sent:
                 return
 
     async def send(
         self,
-        pool: ClientRunspacePool,
         buffer: bool = False,
     ) -> bool:
         """Send PSRP payload.
@@ -506,20 +532,18 @@ class AsyncConnectionInfo(_ConnectionInfoBase):
         Send the next PSRP payload for the Runspace Pool.
 
         Args:
-            pool: The Runspace Pool to send the payload to.
             buffer: When set to `False` will always send the payload regardless
                 of the size. When set to `True` will only send the payload if
                 it hits the max fragment size.
 
         Returns:
             bool: Set to `True` if a payload was sent and `False` if there was
-                no payloads for the pool to send.
+            no payloads for the pool to send.
         """
         raise NotImplementedError()
 
     async def signal(
         self,
-        pool: ClientRunspacePool,
         pipeline_id: uuid.UUID,
     ) -> None:
         """Send a signal to the Runspace Pool/Pipeline
@@ -528,7 +552,6 @@ class AsyncConnectionInfo(_ConnectionInfoBase):
         uses a signal to a Pipeline to request the pipeline to stop.
 
         Args:
-            pool: The Runspace Pool that contains the pipeline to signal.
             pipeline_id: The pipeline to send the signal to.
         """
         raise NotImplementedError()
@@ -539,7 +562,6 @@ class AsyncConnectionInfo(_ConnectionInfoBase):
 
     async def connect(
         self,
-        pool: ClientRunspacePool,
         pipeline_id: t.Optional[uuid.UUID] = None,
     ) -> None:
         """Connect to a Runspace Pool/Pipeline.
@@ -549,53 +571,24 @@ class AsyncConnectionInfo(_ConnectionInfoBase):
         implemented for the core PSRP scenarios.
 
         Args:
-            pool: The Runspace Pool to connect to.
             pipeline_id: If connecting to a pipeline, this is the pipeline id.
         """
         raise NotImplementedError("Disconnection operation not implemented on this connection type")
 
-    async def disconnect(
-        self,
-        pool: ClientRunspacePool,
-    ) -> None:
+    async def disconnect(self) -> None:
         """Disconnect a Runspace Pool.
 
         Disconnects from a Runspace Pool so another client can connect to it.
         This is an optional feature that does not have to be implemented for
         the core PSRP scenarios.
-
-        Args:
-            pool: The Runspace Pool to disconnect.
         """
         raise NotImplementedError("Disconnection operation not implemented on this connection type")
 
-    async def reconnect(
-        self,
-        pool: ClientRunspacePool,
-    ) -> None:
+    async def reconnect(self) -> None:
         """Reconnect a Runspace Pool.
 
         Reconnect to a Runspace Pool that has been disconnected by the same
         client. This is an optional feature that does not have to be
         implemented for the core PSRP scenarios.
-
-        Args:
-            pool: The Runspace Pool to disconnect.
         """
         raise NotImplementedError("Disconnection operation not implemented on this connection type")
-
-    async def enumerate(self) -> t.AsyncIterator[t.Tuple[uuid.UUID, t.List[uuid.UUID]]]:
-        """Find Runspace Pools or Pipelines.
-
-        Find all the Runspace Pools or Pipelines on the connection. This is
-        used to enumerate any disconnected Runspace Pools or Pipelines for
-        :meth:`connect` and :meth:`reconnect`. This is an optional feature
-        that does not have to be implemented for the core PSRP scenarios.
-
-        Returns:
-            AsyncIterator[Tuple[uuid.UUID, List[uuid.UUID]]]: Will yield tuples
-                that contains the Runspace Pool ID with a list of all the
-                pipeline IDs for that Runspace Pool.
-        """
-        raise NotImplementedError("Disconnection operation not implemented on this connection type")
-        yield  # type: ignore[unreachable]  # The yield is needed for mypy to see this as an Iterator

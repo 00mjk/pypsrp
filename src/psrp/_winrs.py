@@ -18,6 +18,11 @@ from psrp._wsman import (
 )
 
 
+class CommandInfo(t.NamedTuple):
+    command_id: uuid.UUID
+    state: str
+
+
 def enumerate_winrs(
     wsman: WSMan,
     resource_uri: str = "http://schemas.microsoft.com/wbem/wsman/1/windows/shell",
@@ -42,9 +47,9 @@ def enumerate_winrs(
 def receive_winrs_enumeration(
     wsman: WSMan,
     event: WSManEvent,
-) -> t.Tuple[t.List["WinRS"], t.List[uuid.UUID]]:
+) -> t.Tuple[t.List["WinRS"], t.List[CommandInfo]]:
     shells: t.List[WinRS] = []
-    commands: t.List[uuid.UUID] = []
+    commands: t.List[CommandInfo] = []
 
     items: t.Optional[ElementTree.Element] = event.body.find(
         "wsen:EnumerateResponse/wsman:Items", namespaces=NAMESPACES
@@ -65,7 +70,8 @@ def receive_winrs_enumeration(
 
             else:
                 command_id = t.cast(ElementTree.Element, raw.find("rsp:CommandId", namespaces=NAMESPACES))
-                commands.append(uuid.UUID(command_id.text))
+                command_state = t.cast(ElementTree.Element, raw.find("rsp:CommandState", namespaces=NAMESPACES))
+                commands.append(CommandInfo(command_id=uuid.UUID(command_id.text), state=command_state.text or ""))
 
     return shells, commands
 
